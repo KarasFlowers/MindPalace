@@ -70,7 +70,7 @@ def describe_trajectory(
         system_prompt=(
             "你是 MindPalace 的认知轨迹分析师。"
             "根据用户不同月份的思维漂移分数，用 2-3 句话描述他的认知变化趋势。"
-            "用第二人称（"你"），简洁有力。"
+            '用第二人称（"你"），简洁有力。'
         ),
         user_prompt=prompt,
         provider_config=cfg,
