@@ -223,11 +223,35 @@ def chat_with_tools(
             kwargs["tools"] = tools_schema
             kwargs["tool_choice"] = "auto"
 
-        try:
-            resp = client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            logger.error("chat_with_tools LLM call failed: %s", exc)
-            return {"content": f"[LLM 调用失败: {exc}]", "tool_calls_used": calls_used, "tool_log": tool_log}
+        # 重试机制（与 chat() 保持一致）
+        resp = None
+        last_exc = None
+        for attempt in range(3):
+            try:
+                resp = client.chat.completions.create(**kwargs)
+                break
+            except RateLimitError:
+                wait = 2 * (attempt + 1)
+                logger.warning("chat_with_tools rate limited, waiting %ss...", wait)
+                time.sleep(wait)
+            except APITimeoutError:
+                logger.warning("chat_with_tools timeout on attempt %d", attempt + 1)
+            except APIStatusError as e:
+                if e.status_code in (403, 401):
+                    logger.error("chat_with_tools auth error (%s), aborting.", e.status_code)
+                    break
+                elif e.status_code in (404, 503):
+                    logger.warning("chat_with_tools server error (%s), retrying...", e.status_code)
+                else:
+                    logger.warning("chat_with_tools API status %s on attempt %d", e.status_code, attempt + 1)
+            except Exception as exc:
+                logger.warning("chat_with_tools unexpected error on attempt %d: %s", attempt + 1, exc)
+                last_exc = exc
+
+        if resp is None:
+            err_msg = f"[LLM 调用失败: {last_exc}]" if last_exc else "[LLM 调用失败]"
+            logger.error("chat_with_tools exhausted retries: %s", err_msg)
+            return {"content": err_msg, "tool_calls_used": calls_used, "tool_log": tool_log}
 
         msg = resp.choices[0].message
 
