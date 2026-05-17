@@ -3,11 +3,12 @@
 import json
 import sqlite3
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from src.config import DB_PATH
 
 logger = logging.getLogger(__name__)
+_db_initialized = False
 
 _CREATE_ARTICLES_TABLE = """
 CREATE TABLE IF NOT EXISTS articles (
@@ -20,9 +21,18 @@ CREATE TABLE IF NOT EXISTS articles (
     scores_json TEXT,
     total_score REAL,
     reasoning   TEXT,
+    is_favorite INTEGER NOT NULL DEFAULT 0,
+    favorited_at TEXT,
+    favorite_note TEXT,
     created_at  TEXT NOT NULL
 );
 """
+
+_ARTICLE_MIGRATION_COLUMNS = [
+    ("is_favorite", "INTEGER NOT NULL DEFAULT 0"),
+    ("favorited_at", "TEXT"),
+    ("favorite_note", "TEXT"),
+]
 
 _CREATE_SCANNED_TABLE = """
 CREATE TABLE IF NOT EXISTS scanned_urls (
@@ -100,15 +110,44 @@ def _get_conn() -> sqlite3.Connection:
 
 def init_db():
     """初始化数据库表。"""
+    global _db_initialized
+    if _db_initialized:
+        return
     with _get_conn() as conn:
         conn.execute(_CREATE_ARTICLES_TABLE)
+        _migrate_article_columns(conn)
         conn.execute(_CREATE_SCANNED_TABLE)
         conn.execute(_CREATE_CHAT_SESSIONS_TABLE)
         conn.execute(_CREATE_LEARNING_PROGRESS_TABLE)
         conn.execute(_CREATE_DEBATES_TABLE)
         conn.execute(_CREATE_PROFILE_CRYSTALS_TABLE)
         conn.execute(_CREATE_FEEDBACK_TABLE)
+    _db_initialized = True
     logger.info("Database initialized at %s", DB_PATH)
+
+
+def _migrate_article_columns(conn: sqlite3.Connection):
+    """为旧 articles 表补齐收藏相关列。"""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(articles)").fetchall()}
+    for col_name, col_type in _ARTICLE_MIGRATION_COLUMNS:
+        if col_name not in existing:
+            conn.execute(f"ALTER TABLE articles ADD COLUMN {col_name} {col_type}")
+            logger.info("Migrated articles table: added column '%s'", col_name)
+
+
+def _row_to_article_dict(row) -> dict:
+    d = dict(row)
+    d["scores"] = json.loads(d.pop("scores_json", "{}"))
+    d["is_favorite"] = bool(d.get("is_favorite", 0))
+    return d
+
+
+def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
 
 
 def save_articles(articles) -> None:
@@ -177,24 +216,108 @@ def get_article(article_id: int) -> dict | None:
         ).fetchone()
     if row is None:
         return None
-    result = dict(row)
-    result["scores"] = json.loads(result.pop("scores_json", "{}"))
-    return result
+    return _row_to_article_dict(row)
 
 
-def list_articles(limit: int = 20) -> list[dict]:
+def list_articles(limit: int = 20, favorites_only: bool = False) -> list[dict]:
     """列出最近的文章，按总分降序。"""
     init_db()
     with _get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM articles ORDER BY total_score DESC LIMIT ?", (limit,)
-        ).fetchall()
-    results = []
-    for row in rows:
-        d = dict(row)
-        d["scores"] = json.loads(d.pop("scores_json", "{}"))
-        results.append(d)
-    return results
+        if favorites_only:
+            rows = conn.execute(
+                """
+                SELECT * FROM articles
+                WHERE is_favorite = 1
+                ORDER BY favorited_at DESC, total_score DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM articles ORDER BY total_score DESC LIMIT ?", (limit,)
+            ).fetchall()
+    return [_row_to_article_dict(row) for row in rows]
+
+
+def set_article_favorite(article_id: int, favorite: bool = True, note: str | None = None) -> bool:
+    """收藏或取消收藏文章。返回是否成功找到文章。"""
+    init_db()
+    now = datetime.now(timezone.utc).isoformat() if favorite else None
+    with _get_conn() as conn:
+        if favorite:
+            cursor = conn.execute(
+                """
+                UPDATE articles
+                SET is_favorite = 1,
+                    favorited_at = COALESCE(favorited_at, ?),
+                    favorite_note = COALESCE(?, favorite_note)
+                WHERE id = ?
+                """,
+                (now, note, article_id),
+            )
+        else:
+            cursor = conn.execute(
+                """
+                UPDATE articles
+                SET is_favorite = 0, favorited_at = NULL, favorite_note = NULL
+                WHERE id = ?
+                """,
+                (article_id,),
+            )
+    return cursor.rowcount > 0
+
+
+def cleanup_old_articles(
+    retention_days: int,
+    dry_run: bool = False,
+    keep_discussed: bool = True,
+) -> dict:
+    """清理超过保留期的普通文章，收藏文章永远保留。"""
+    init_db()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    cutoff_iso = cutoff.isoformat()
+
+    with _get_conn() as conn:
+        protection_clauses = []
+        if keep_discussed and _table_exists(conn, "debates"):
+            protection_clauses.append(
+                "id NOT IN (SELECT article_id FROM debates WHERE article_id IS NOT NULL)"
+            )
+        if keep_discussed and _table_exists(conn, "memories"):
+            protection_clauses.append(
+                "id NOT IN (SELECT article_id FROM memories WHERE article_id IS NOT NULL)"
+            )
+        protected_sql = "".join(f" AND {clause}" for clause in protection_clauses)
+
+        select_sql = f"""
+            SELECT id, title, source, created_at, total_score
+            FROM articles
+            WHERE is_favorite = 0
+              AND created_at < ?
+              {protected_sql}
+            ORDER BY created_at ASC
+        """
+        delete_sql = f"""
+            DELETE FROM articles
+            WHERE is_favorite = 0
+              AND created_at < ?
+              {protected_sql}
+        """
+
+        candidates = [dict(row) for row in conn.execute(select_sql, (cutoff_iso,)).fetchall()]
+        deleted_count = 0
+        if not dry_run and candidates:
+            cursor = conn.execute(delete_sql, (cutoff_iso,))
+            deleted_count = cursor.rowcount
+
+    return {
+        "cutoff": cutoff_iso,
+        "dry_run": dry_run,
+        "deleted_count": deleted_count,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+    }
 
 
 # ---------------- debates ----------------
