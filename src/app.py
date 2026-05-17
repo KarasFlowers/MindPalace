@@ -3,6 +3,7 @@
 import argparse
 import io
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -17,12 +18,26 @@ from questionary import Style
 from src.scout.pipeline import run_scout
 from src.council.flow import run_council
 from src.council.output import format_council_result
-from src.storage.db import get_article, list_articles, save_debate
+from src.storage.db import (
+    cleanup_old_articles,
+    get_article,
+    list_articles,
+    save_debate,
+    set_article_favorite,
+)
 from src.memory.profiler import profile_response
 from src.memory.store import save_memory, find_related_memories, get_all_memories
 from src.memory.echo import generate_echo_report, format_echo_report
 from src.workflows.daily_session import run_daily_session
-from src.config import PROJECT_ROOT, get_scout_config, get_council_config, get_memory_config
+from src.config import (
+    ARTICLE_RETENTION_DAYS,
+    FEED_PRESETS,
+    PROJECT_ROOT,
+    get_default_feeds,
+    get_scout_config,
+    get_council_config,
+    get_memory_config,
+)
 from dotenv import set_key, get_key
 import shutil
 
@@ -40,6 +55,30 @@ COLORS = {
     "BOLD": BOLD, "DIM": DIM, "CYAN": CYAN, "YELLOW": YELLOW,
     "GREEN": GREEN, "RED": RED, "MAGENTA": MAGENTA, "RESET": RESET,
 }
+
+PROVIDER_PREFIXES = {
+    "global": "OPENAI",
+    "scout": "SCOUT",
+    "council": "COUNCIL",
+    "memory": "MEMORY",
+    "fast": "FAST",
+    "router": "ROUTER",
+    "judge": "JUDGE",
+    "embedding": "EMBEDDING",
+}
+
+PROVIDER_LABELS = {
+    "OPENAI": "Global Default",
+    "SCOUT": "Scout",
+    "COUNCIL": "Council",
+    "MEMORY": "Memory",
+    "FAST": "Fast",
+    "ROUTER": "Router",
+    "JUDGE": "Judge",
+    "EMBEDDING": "Embedding",
+}
+
+PROVIDER_CLI_NAMES = {prefix: cli_name for cli_name, prefix in PROVIDER_PREFIXES.items()}
 
 # Questionary 自定义样式
 custom_style = Style([
@@ -108,7 +147,12 @@ def _display_results(articles):
 
 def cmd_scout(args):
     """执行 Scout 流水线。"""
-    feeds = args.feeds if args.feeds else None
+    if args.feeds:
+        feeds = args.feeds
+    elif args.preset:
+        feeds = get_default_feeds(args.preset)
+    else:
+        feeds = None
     cfg = get_scout_config()
     results = run_scout(feed_urls=feeds, top_k=args.top, provider_config=cfg)
     _display_results(results)
@@ -127,10 +171,84 @@ def cmd_list(args):
 
     for a in articles:
         scores = a.get("scores", {})
-        print(f"  {BOLD}{CYAN}ID:{a['id']}{RESET} {BOLD}{a['title']}{RESET}")
+        favorite = f" {YELLOW}[收藏]{RESET}" if a.get("is_favorite") else ""
+        print(f"  {BOLD}{CYAN}ID:{a['id']}{RESET}{favorite} {BOLD}{a['title']}{RESET}")
         print(f"     {DIM}[SRC] {a['source']}  |  Score: {a['total_score']:.1f}/10{RESET}")
         print(f"     {MAGENTA}> {a.get('summary', '')}{RESET}")
         print(f"     {DIM}{'─' * 50}{RESET}\n")
+
+
+def cmd_favorite(args):
+    """收藏文章。"""
+    article = get_article(args.item)
+    if not article:
+        print(f"\n{RED}Article ID {args.item} not found. Use 'list' to see available articles.{RESET}")
+        return
+
+    set_article_favorite(args.item, favorite=True, note=args.note)
+    print(f"\n{GREEN}已收藏：{article['title']}{RESET}\n")
+
+
+def cmd_unfavorite(args):
+    """取消收藏文章。"""
+    article = get_article(args.item)
+    if not article:
+        print(f"\n{RED}Article ID {args.item} not found. Use 'favorites' to see saved articles.{RESET}")
+        return
+
+    set_article_favorite(args.item, favorite=False)
+    print(f"\n{YELLOW}已取消收藏：{article['title']}{RESET}\n")
+
+
+def cmd_favorites(args):
+    """列出收藏夹文章。"""
+    articles = list_articles(limit=args.limit, favorites_only=True)
+    if not articles:
+        print(f"\n{YELLOW}收藏夹还没有文章。看到值得反复讨论的材料，可以用 favorite 收藏。{RESET}")
+        return
+
+    print(f"\n{BOLD}{CYAN}{'=' * 60}")
+    print(f"  [MindPalace] -- Favorites")
+    print(f"{'=' * 60}{RESET}\n")
+
+    for a in articles:
+        note = a.get("favorite_note")
+        print(f"  {BOLD}{CYAN}ID:{a['id']}{RESET} {BOLD}{a['title']}{RESET}")
+        print(f"     {DIM}[SRC] {a['source']}  |  Score: {a['total_score']:.1f}/10{RESET}")
+        if note:
+            print(f"     {YELLOW}Note: {note}{RESET}")
+        print(f"     {MAGENTA}> {a.get('summary', '')}{RESET}")
+        print(f"     {DIM}{'─' * 50}{RESET}\n")
+
+
+def cmd_cleanup(args):
+    """清理旧文章。"""
+    if args.days < 1:
+        print(f"\n{RED}保留天数必须大于等于 1。{RESET}\n")
+        return
+
+    result = cleanup_old_articles(
+        retention_days=args.days,
+        dry_run=args.dry_run,
+        keep_discussed=not args.include_discussed,
+    )
+
+    action = "可清理" if args.dry_run else "已清理"
+    count = result["candidate_count"] if args.dry_run else result["deleted_count"]
+    print(f"\n{BOLD}{CYAN}[Article Cleanup]{RESET}")
+    print(f"  保留天数: {args.days}")
+    print(f"  收藏文章: 永远保留")
+    print(f"  已讨论/已记忆文章: {'也会清理' if args.include_discussed else '默认保留'}")
+    print(f"  {action}: {count} 篇\n")
+
+    candidates = result.get("candidates", [])[:10]
+    if candidates:
+        print(f"  {DIM}候选预览:{RESET}")
+        for item in candidates:
+            print(f"  - ID:{item['id']} {item['title'][:60]}")
+        if len(result.get("candidates", [])) > 10:
+            print(f"  {DIM}... 还有 {len(result['candidates']) - 10} 篇{RESET}")
+        print()
 
 
 def cmd_view(args):
@@ -373,14 +491,180 @@ def _configure_provider(env_path: Path, prefix: str):
     new_key = input(f"    API_KEY [{mask_key}]: ").strip()
     if new_key:
         set_key(env_path, f"{prefix}_API_KEY", new_key)
+        os.environ[f"{prefix}_API_KEY"] = new_key
+        current_key = new_key
 
     new_url = input(f"    BASE_URL [{current_url}]: ").strip()
     if new_url:
         set_key(env_path, f"{prefix}_BASE_URL", new_url)
+        os.environ[f"{prefix}_BASE_URL"] = new_url
+        current_url = new_url
 
     new_models = input(f"    MODEL_NAMES [{current_models}]: ").strip()
     if new_models:
         set_key(env_path, f"{prefix}_MODEL_NAMES", new_models)
+        os.environ[f"{prefix}_MODEL_NAMES"] = new_models
+        current_models = new_models
+
+    return _read_provider_config_from_env_file(env_path, prefix)
+
+
+def _read_provider_config_from_env_file(env_path: Path, prefix: str) -> dict:
+    """从 .env 读取指定 Provider，保持与 src.config 的回退规则一致。"""
+    api_key = get_key(env_path, f"{prefix}_API_KEY")
+    if not api_key and prefix != "OPENAI":
+        api_key = get_key(env_path, "OPENAI_API_KEY")
+
+    base_url = get_key(env_path, f"{prefix}_BASE_URL")
+    if not base_url and prefix != "OPENAI":
+        base_url = get_key(env_path, "OPENAI_BASE_URL") or "https://api.openai.com/v1"
+    elif not base_url:
+        base_url = "https://api.openai.com/v1"
+
+    models_raw = get_key(env_path, f"{prefix}_MODEL_NAMES") or get_key(env_path, f"{prefix}_MODEL_NAME")
+    if not models_raw and prefix == "OPENAI":
+        models_raw = get_key(env_path, "MODEL_NAMES") or get_key(env_path, "MODEL_NAME")
+    if not models_raw and prefix != "OPENAI":
+        models_raw = get_key(env_path, "MODEL_NAMES") or get_key(env_path, "MODEL_NAME")
+
+    models = [m.strip() for m in (models_raw or "").split(",") if m.strip()]
+    return {
+        "api_key": api_key,
+        "base_url": base_url,
+        "models": models,
+    }
+
+
+def _test_provider_config(prefix: str, provider_config: dict) -> bool:
+    """对指定 Provider 发起最小 LLM 调用，检测 API Key/Base URL/模型是否可用。"""
+    display_prefix = "GLOBAL DEFAULT" if prefix == "OPENAI" else prefix
+    api_key = provider_config.get("api_key")
+    base_url = provider_config.get("base_url") or "https://api.openai.com/v1"
+    models = provider_config.get("models") or []
+
+    print(f"\n  {BOLD}{CYAN}--- Testing {display_prefix} ---{RESET}")
+    print(f"  {DIM}BASE_URL: {base_url}{RESET}")
+
+    if not api_key:
+        print(f"  {RED}API Key 未设置。{RESET}\n")
+        _print_reconfigure_hint(prefix)
+        return False
+    if not models:
+        print(f"  {RED}MODEL_NAMES 未设置。{RESET}\n")
+        _print_reconfigure_hint(prefix)
+        return False
+
+    if prefix == "EMBEDDING":
+        return _test_embedding_provider_config(display_prefix, api_key, base_url, models)
+
+    from src.llm.client import chat
+
+    ok = True
+    for model in models:
+        print(f"  {DIM}Testing model: {model} ...{RESET}")
+        try:
+            response = chat(
+                system_prompt="You are a connection test endpoint. Reply briefly.",
+                user_prompt="请只回复 OK。",
+                model=model,
+                max_retries=1,
+                provider_config={
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "models": [model],
+                },
+            )
+            preview = (response or "").replace("\n", " ").strip()[:80]
+            print(f"  {GREEN}✓ {model} 可用{RESET} {DIM}{preview}{RESET}")
+        except Exception as exc:
+            ok = False
+            print(f"  {RED}✗ {model} 不可用：{exc}{RESET}")
+
+    print()
+    if not ok:
+        _print_reconfigure_hint(prefix)
+    return ok
+
+
+def _test_embedding_provider_config(display_prefix: str, api_key: str, base_url: str, models: list[str]) -> bool:
+    """检测 Embedding Provider，走 embeddings 接口而不是 chat 接口。"""
+    from openai import OpenAI
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
+    ok = True
+
+    for model in models:
+        print(f"  {DIM}Testing embedding model: {model} ...{RESET}")
+        try:
+            resp = client.embeddings.create(model=model, input=["MindPalace embedding test"])
+            vector_dim = len(resp.data[0].embedding) if resp.data else 0
+            print(f"  {GREEN}✓ {model} 可用{RESET} {DIM}vector_dim={vector_dim}{RESET}")
+        except Exception as exc:
+            ok = False
+            print(f"  {RED}✗ {model} 不可用：{exc}{RESET}")
+
+    print()
+    if not ok:
+        prefix = "OPENAI" if display_prefix == "GLOBAL DEFAULT" else display_prefix
+        _print_reconfigure_hint(prefix)
+    return ok
+
+
+def _print_reconfigure_hint(prefix: str) -> None:
+    """在检测失败后打印重配引导。"""
+    label = PROVIDER_LABELS.get(prefix, prefix)
+    cli_name = PROVIDER_CLI_NAMES.get(prefix, "global")
+
+    print(f"  {YELLOW}建议重新配置 {label}。{RESET}")
+    print(f"  {DIM}菜单路径：设置 -> 配置 API / 模型 -> {label}{RESET}")
+    print(f"  {DIM}命令行检测：python -m src config --test --provider {cli_name}{RESET}")
+    print(f"  {DIM}重点检查：API_KEY / BASE_URL / MODEL_NAMES{RESET}\n")
+
+
+def _test_all_provider_configs(env_path: Path) -> dict:
+    """批量检测所有 Provider，重复配置只真实调用一次。"""
+    print(f"\n  {BOLD}{CYAN}--- Testing All Providers ---{RESET}")
+    print(f"  {DIM}会按各 Provider 的最终生效配置检测；重复配置会复用结果。{RESET}\n")
+
+    seen_signatures: dict[tuple, tuple[bool, str]] = {}
+    results: list[tuple[str, bool]] = []
+    failed_prefixes: list[str] = []
+
+    for _, prefix in PROVIDER_PREFIXES.items():
+        cfg = _read_provider_config_from_env_file(env_path, prefix)
+        display_prefix = "GLOBAL DEFAULT" if prefix == "OPENAI" else prefix
+        mode = "embedding" if prefix == "EMBEDDING" else "chat"
+        signature = (
+            mode,
+            cfg.get("api_key") or "",
+            cfg.get("base_url") or "https://api.openai.com/v1",
+            tuple(cfg.get("models") or []),
+        )
+
+        if signature in seen_signatures:
+            ok, source_prefix = seen_signatures[signature]
+            marker = f"{GREEN}✓{RESET}" if ok else f"{RED}✗{RESET}"
+            print(f"  {marker} {display_prefix}  {DIM}(复用 {source_prefix} 的检测结果){RESET}")
+        else:
+            ok = _test_provider_config(prefix, cfg)
+            seen_signatures[signature] = (ok, display_prefix)
+
+        results.append((display_prefix, ok))
+        if not ok:
+            failed_prefixes.append(prefix)
+
+    passed = sum(1 for _, ok in results if ok)
+    total = len(results)
+    print(f"  {BOLD}Summary:{RESET} {passed}/{total} providers passed.\n")
+    if failed_prefixes:
+        failed_labels = ", ".join(PROVIDER_LABELS.get(prefix, prefix) for prefix in failed_prefixes)
+        print(f"  {YELLOW}检测失败的 Provider：{failed_labels}{RESET}")
+        print(f"  {DIM}你可以回到“设置 -> 配置 API / 模型”逐个重配，再重新执行全部检测。{RESET}\n")
+
+    return {
+        "all_ok": passed == total,
+        "failed_prefixes": failed_prefixes,
+    }
 
 
 def cmd_eval(args):
@@ -421,6 +705,16 @@ def cmd_config(args):
         else:
             env_path.touch()
 
+    if getattr(args, "test", False):
+        if args.provider == "all":
+            _test_all_provider_configs(env_path)
+            return
+
+        prefix = PROVIDER_PREFIXES.get(args.provider, "OPENAI")
+        cfg = _read_provider_config_from_env_file(env_path, prefix)
+        _test_provider_config(prefix, cfg)
+        return
+
     print(f"\n{BOLD}{MAGENTA}{'=' * 60}")
     print(f"  [MindPalace] -- Interactive Configuration")
     print(f"{'=' * 60}{RESET}")
@@ -440,9 +734,13 @@ def cmd_config(args):
     }
     
     prefix = prefix_map.get(choice, "OPENAI")
-    _configure_provider(env_path, prefix)
+    cfg = _configure_provider(env_path, prefix)
 
     print(f"\n  {BOLD}{GREEN}✓ Configuration saved securely to .env!{RESET}\n")
+
+    test_now = input("  Test this provider now? [Y/n]: ").strip().lower()
+    if test_now in ("", "y", "yes"):
+        _test_provider_config(prefix, cfg)
 
 
 def interactive_menu():
@@ -461,13 +759,11 @@ def interactive_menu():
         action = questionary.select(
             "请选择功能：",
             choices=[
-                "🎯 Scout - 抓取并评分高质量内容",
-                "📚 Browse - 浏览文章（查看/导读/讨论）",
-                "🧠 Memory - 查看认知进化历史",
-                "🚀 Daily - 一键完整流程",
-                "💬 Resolve - 进入交互式对话",
-                "📊 Eval - 周度评估报告",
-                "⚙️  Config - 配置 API",
+                "🚀 今日练习",
+                "📚 文章库",
+                "💬 深度对话",
+                "🧠 认知回顾",
+                "⚙️  设置",
                 questionary.Separator(),
                 "❌ 退出"
             ],
@@ -479,18 +775,14 @@ def interactive_menu():
             break
 
         try:
-            if action.startswith("🎯"):
-                _interactive_scout()
-            elif action.startswith("📚"):
-                _interactive_list()
-            elif action.startswith("🧠"):
-                _interactive_memory()
-            elif action.startswith("🚀"):
+            if action.startswith("🚀"):
                 run_daily_session()
+            elif action.startswith("📚"):
+                _interactive_library()
             elif action.startswith("💬"):
                 _interactive_resolve()
-            elif action.startswith("📊"):
-                _interactive_eval()
+            elif action.startswith("🧠"):
+                _interactive_cognition()
             elif action.startswith("⚙️"):
                 _interactive_config()
         except KeyboardInterrupt:
@@ -499,6 +791,66 @@ def interactive_menu():
         except Exception as e:
             print(f"\n{RED}错误: {e}{RESET}\n")
             logging.exception("Error in interactive menu")
+
+
+def _interactive_library():
+    """文章库子菜单。"""
+    while True:
+        action = questionary.select(
+            "文章库：",
+            choices=[
+                "🎯 发现新文章",
+                "📚 浏览文章",
+                "⭐ 收藏夹",
+                "🧹 清理旧文章",
+                questionary.Separator(),
+                "🔙 返回主菜单",
+            ],
+            style=custom_style,
+        ).ask()
+
+        if not action or action.startswith("🔙"):
+            return
+
+        try:
+            if action.startswith("🎯"):
+                _interactive_scout()
+            elif action.startswith("📚"):
+                _interactive_list()
+            elif action.startswith("⭐"):
+                _interactive_list(favorites_only=True)
+            elif action.startswith("🧹"):
+                _interactive_cleanup()
+        except KeyboardInterrupt:
+            print(f"\n{DIM}操作已取消{RESET}\n")
+            return
+
+
+def _interactive_cognition():
+    """认知回顾子菜单。"""
+    while True:
+        action = questionary.select(
+            "认知回顾：",
+            choices=[
+                "🧠 查看认知历史",
+                "📊 周度评估报告",
+                questionary.Separator(),
+                "🔙 返回主菜单",
+            ],
+            style=custom_style,
+        ).ask()
+
+        if not action or action.startswith("🔙"):
+            return
+
+        try:
+            if action.startswith("🧠"):
+                _interactive_memory()
+            elif action.startswith("📊"):
+                _interactive_eval()
+        except KeyboardInterrupt:
+            print(f"\n{DIM}操作已取消{RESET}\n")
+            return
 
 
 def _interactive_scout():
@@ -523,11 +875,14 @@ def _interactive_scout():
     _display_results(results)
 
 
-def _interactive_list():
+def _interactive_list(favorites_only: bool = False):
     """交互式 List - 整合 View 和 Brief 功能。"""
-    articles = list_articles(limit=20)
+    articles = list_articles(limit=20, favorites_only=favorites_only)
     if not articles:
-        print(f"\n{YELLOW}数据库中暂无文章。请先运行 Scout。{RESET}\n")
+        if favorites_only:
+            print(f"\n{YELLOW}收藏夹还没有文章。可以先在 Browse 里收藏高价值文章。{RESET}\n")
+        else:
+            print(f"\n{YELLOW}数据库中暂无文章。请先运行 Scout。{RESET}\n")
         return
 
     # 构建选择列表（纯文本，无颜色代码）
@@ -536,7 +891,8 @@ def _interactive_list():
         score_bar = _format_score_bar_plain(a['total_score'])
         # 截断标题避免过长
         title = a['title'][:50] + "..." if len(a['title']) > 50 else a['title']
-        choice_text = f"[ID:{a['id']}] {title} {score_bar}"
+        favorite_mark = "[收藏] " if a.get("is_favorite") else ""
+        choice_text = f"[ID:{a['id']}] {favorite_mark}{title} {score_bar}"
         choices.append(choice_text)
     
     choices.append(questionary.Separator())
@@ -574,6 +930,7 @@ def _interactive_list():
             "📖 生成导读精炼版",
             "🌐 查看原文（浏览器打开）",
             "🏛️  发起议事厅讨论",
+            "⭐ 取消收藏" if article.get("is_favorite") else "⭐ 收藏到收藏夹",
             questionary.Separator(),
             "🔙 返回文章列表"
         ],
@@ -581,17 +938,23 @@ def _interactive_list():
     ).ask()
     
     if not action or action.startswith("🔙"):
-        _interactive_list()  # 递归返回列表
+        _interactive_list(favorites_only=favorites_only)  # 递归返回列表
         return
     
     if action.startswith("📖"):
         _show_brief(article)
-        _interactive_list()  # 操作完成后返回列表
+        _interactive_list(favorites_only=favorites_only)  # 操作完成后返回列表
     elif action.startswith("🌐"):
         _open_in_browser(article)
-        _interactive_list()
+        _interactive_list(favorites_only=favorites_only)
     elif action.startswith("🏛️"):
         _start_council(article)
+    elif action.startswith("⭐"):
+        set_article_favorite(article["id"], favorite=not article.get("is_favorite"))
+        status = "已收藏" if not article.get("is_favorite") else "已取消收藏"
+        print(f"\n{GREEN if not article.get('is_favorite') else YELLOW}{status}: {article['title']}{RESET}\n")
+        input(f"{DIM}按 Enter 继续...{RESET}")
+        _interactive_list(favorites_only=favorites_only)
 
 
 def _show_brief(article):
@@ -881,6 +1244,59 @@ def _interactive_eval():
         print(f"\n{suggestions}\n")
 
 
+def _interactive_cleanup():
+    """交互式清理旧文章。"""
+    days_str = questionary.text(
+        "普通文章保留多少天？",
+        default=str(ARTICLE_RETENTION_DAYS),
+        style=custom_style,
+    ).ask()
+    if not days_str:
+        return
+    try:
+        days = int(days_str)
+    except ValueError:
+        print(f"{RED}请输入有效数字{RESET}")
+        return
+    if days < 1:
+        print(f"{RED}保留天数必须大于等于 1。{RESET}")
+        return
+
+    dry_run = questionary.confirm(
+        "先预览，不实际删除？",
+        default=True,
+        style=custom_style,
+    ).ask()
+    if dry_run is None:
+        return
+
+    include_discussed = questionary.confirm(
+        "也清理已讨论/已记忆的旧文章？",
+        default=False,
+        style=custom_style,
+    ).ask()
+    if include_discussed is None:
+        return
+
+    result = cleanup_old_articles(
+        retention_days=days,
+        dry_run=dry_run,
+        keep_discussed=not include_discussed,
+    )
+
+    count = result["candidate_count"] if dry_run else result["deleted_count"]
+    print(f"\n{BOLD}{CYAN}[Article Cleanup]{RESET}")
+    print(f"  {'可清理' if dry_run else '已清理'}: {count} 篇")
+    print(f"  {DIM}收藏文章会始终保留。{RESET}\n")
+
+    for item in result.get("candidates", [])[:10]:
+        print(f"  - ID:{item['id']} {item['title'][:60]}")
+    if len(result.get("candidates", [])) > 10:
+        print(f"  {DIM}... 还有 {len(result['candidates']) - 10} 篇{RESET}")
+    print()
+    input(f"{DIM}按 Enter 继续...{RESET}")
+
+
 def _interactive_config():
     """交互式 Config。"""
     env_path = PROJECT_ROOT / ".env"
@@ -892,31 +1308,114 @@ def _interactive_config():
         else:
             env_path.touch()
 
-    provider = questionary.select(
-        "选择要配置的 Provider：",
+    action = questionary.select(
+        "设置：",
         choices=[
-            "Global Default (全局默认)",
-            "Scout (评分/排序)",
-            "Council (讨论/对话)",
-            "Memory (认知画像)",
+            "🔧 配置 API / 模型",
+            "🧪 检测 API 是否可用",
+            questionary.Separator(),
+            "🔙 返回主菜单",
         ],
-        style=custom_style
+        style=custom_style,
     ).ask()
-    
+
+    if not action or action.startswith("🔙"):
+        return
+
+    provider = _select_provider_for_config(allow_all=action.startswith("🧪"))
     if not provider:
         return
-    
+
+    if action.startswith("🔧"):
+        cfg = _configure_provider(env_path, provider)
+        print(f"\n  {BOLD}{GREEN}✓ Configuration saved!{RESET}\n")
+        test_now = questionary.confirm(
+            "是否立即检测这个配置？",
+            default=True,
+            style=custom_style,
+        ).ask()
+        if test_now:
+            _test_provider_config(provider, cfg)
+    elif action.startswith("🧪"):
+        if provider == "ALL":
+            result = _test_all_provider_configs(env_path)
+            if not result["all_ok"]:
+                _prompt_reconfigure_failed_provider(env_path, result["failed_prefixes"])
+        else:
+            cfg = _read_provider_config_from_env_file(env_path, provider)
+            ok = _test_provider_config(provider, cfg)
+            if not ok:
+                reconfigure_now = questionary.confirm(
+                    f"{PROVIDER_LABELS.get(provider, provider)} 检测失败，现在重新配置？",
+                    default=True,
+                    style=custom_style,
+                ).ask()
+                if reconfigure_now:
+                    updated_cfg = _configure_provider(env_path, provider)
+                    print(f"\n  {BOLD}{GREEN}✓ Configuration saved!{RESET}\n")
+                    _test_provider_config(provider, updated_cfg)
+
+
+def _select_provider_for_config(allow_all: bool = False) -> str | None:
+    choices = [
+        "Global Default (全局默认)",
+        "Scout (评分/排序)",
+        "Council (讨论/对话)",
+        "Memory (认知画像)",
+        "Fast (轻量任务)",
+        "Router (难度路由)",
+        "Judge (最终裁决/评估)",
+        "Embedding (向量化)",
+    ]
+    if allow_all:
+        choices.append("All Providers (全部检测)")
+    choices.extend([questionary.Separator(), "🔙 返回"])
+
+    provider = questionary.select(
+        "选择 Provider：",
+        choices=choices,
+        style=custom_style,
+    ).ask()
+
+    if not provider or provider.startswith("🔙"):
+        return None
+
     prefix_map = {
         "Global Default (全局默认)": "OPENAI",
         "Scout (评分/排序)": "SCOUT",
         "Council (讨论/对话)": "COUNCIL",
-        "Memory (认知画像)": "MEMORY"
+        "Memory (认知画像)": "MEMORY",
+        "Fast (轻量任务)": "FAST",
+        "Router (难度路由)": "ROUTER",
+        "Judge (最终裁决/评估)": "JUDGE",
+        "Embedding (向量化)": "EMBEDDING",
+        "All Providers (全部检测)": "ALL",
     }
-    
-    prefix = prefix_map.get(provider, "OPENAI")
-    _configure_provider(env_path, prefix)
+    return prefix_map.get(provider, "OPENAI")
 
+
+def _prompt_reconfigure_failed_provider(env_path: Path, failed_prefixes: list[str]) -> None:
+    """在全部检测失败后，引导用户直接进入重配流程。"""
+    if not failed_prefixes:
+        return
+
+    choices = [f"{PROVIDER_LABELS.get(prefix, prefix)}" for prefix in failed_prefixes]
+    choices.extend([questionary.Separator(), "暂时不配置"])
+
+    selected = questionary.select(
+        "选择一个失败的 Provider 立即重配：",
+        choices=choices,
+        style=custom_style,
+    ).ask()
+
+    if not selected or selected == "暂时不配置":
+        return
+
+    label_to_prefix = {PROVIDER_LABELS.get(prefix, prefix): prefix for prefix in failed_prefixes}
+    prefix = label_to_prefix[selected]
+    updated_cfg = _configure_provider(env_path, prefix)
     print(f"\n  {BOLD}{GREEN}✓ Configuration saved!{RESET}\n")
+    _test_provider_config(prefix, updated_cfg)
 
 
 def main():
@@ -935,6 +1434,11 @@ def main():
         "--feeds", nargs="*", help="Custom RSS feed URLs"
     )
     scout_parser.add_argument(
+        "--preset",
+        choices=sorted(FEED_PRESETS.keys()),
+        help="Built-in feed preset: humanities, mixed, or tech",
+    )
+    scout_parser.add_argument(
         "--top", type=int, default=5, help="Return top N results (default: 5)"
     )
     scout_parser.set_defaults(func=cmd_scout)
@@ -945,6 +1449,48 @@ def main():
         "--limit", type=int, default=20, help="Max articles to show (default: 20)"
     )
     list_parser.set_defaults(func=cmd_list)
+
+    # favorite
+    favorite_parser = subparsers.add_parser("favorite", help="Add an article to favorites")
+    favorite_parser.add_argument(
+        "--item", type=int, required=True, help="Article ID (use 'list' to see IDs)"
+    )
+    favorite_parser.add_argument(
+        "--note", type=str, help="Optional note for why this article is worth keeping"
+    )
+    favorite_parser.set_defaults(func=cmd_favorite)
+
+    # unfavorite
+    unfavorite_parser = subparsers.add_parser("unfavorite", help="Remove an article from favorites")
+    unfavorite_parser.add_argument(
+        "--item", type=int, required=True, help="Article ID (use 'favorites' to see IDs)"
+    )
+    unfavorite_parser.set_defaults(func=cmd_unfavorite)
+
+    # favorites
+    favorites_parser = subparsers.add_parser("favorites", help="List favorite articles")
+    favorites_parser.add_argument(
+        "--limit", type=int, default=20, help="Max articles to show (default: 20)"
+    )
+    favorites_parser.set_defaults(func=cmd_favorites)
+
+    # cleanup
+    cleanup_parser = subparsers.add_parser("cleanup", help="Clean old non-favorite articles")
+    cleanup_parser.add_argument(
+        "--days",
+        type=int,
+        default=ARTICLE_RETENTION_DAYS,
+        help=f"Keep non-favorite articles for N days (default: {ARTICLE_RETENTION_DAYS})",
+    )
+    cleanup_parser.add_argument(
+        "--dry-run", action="store_true", help="Preview cleanup without deleting"
+    )
+    cleanup_parser.add_argument(
+        "--include-discussed",
+        action="store_true",
+        help="Also delete old articles that have debates or memories",
+    )
+    cleanup_parser.set_defaults(func=cmd_cleanup)
 
     # view
     view_parser = subparsers.add_parser("view", help="View full article content")
@@ -998,6 +1544,17 @@ def main():
 
     # config
     config_parser = subparsers.add_parser("config", help="Interactive setup for API Key and Models")
+    config_parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Test whether a configured provider can complete a minimal LLM call",
+    )
+    config_parser.add_argument(
+        "--provider",
+        choices=["all", "global", "scout", "council", "memory", "fast", "router", "judge", "embedding"],
+        default="global",
+        help="Provider to test when using --test (default: global, use 'all' for every provider)",
+    )
     config_parser.set_defaults(func=cmd_config)
 
     args = parser.parse_args()
