@@ -20,3 +20,14 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# IDE / AI assistant config
+.claude/
+CLAUDE.md
+
+# Workspace / project meta
+*.code-workspace
+
+# Personal notes / interviews
+interview_qa.md
+introduction.md
