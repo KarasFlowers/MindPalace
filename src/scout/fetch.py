@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import feedparser
+import httpx
 from src.config import MAX_WORKERS
 
 logger = logging.getLogger(__name__)
@@ -32,7 +33,13 @@ def fetch_rss(feed_url: str) -> list[RawArticle]:
         RawArticle 列表。
     """
     logger.info("Fetching RSS: %s", feed_url)
-    feed = feedparser.parse(feed_url)
+    try:
+        resp = httpx.get(feed_url, timeout=15.0, follow_redirects=True)
+        resp.raise_for_status()
+        feed = feedparser.parse(resp.text)
+    except Exception as exc:
+        logger.warning("Feed 获取失败: %s — %s", feed_url, exc)
+        return []
 
     if feed.bozo and not feed.entries:
         logger.warning("Feed 解析异常: %s — %s", feed_url, feed.bozo_exception)

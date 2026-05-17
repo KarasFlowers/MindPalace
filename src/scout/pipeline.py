@@ -4,11 +4,26 @@ import logging
 from src.scout.fetch import fetch_all
 from src.scout.normalize import normalize_all
 from src.scout.score import score_all, ScoredArticle
-from src.storage.db import save_articles, get_existing_urls, mark_as_scanned
-from src.config import DEFAULT_FEEDS, SCOUT_TOP_K
+from src.storage.db import cleanup_old_articles, save_articles, get_existing_urls, mark_as_scanned
+from src.config import ARTICLE_AUTO_CLEANUP, ARTICLE_RETENTION_DAYS, get_default_feeds, SCOUT_TOP_K
 from src.obs import span
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_cleanup_old_articles(save: bool) -> None:
+    if not save or not ARTICLE_AUTO_CLEANUP:
+        return
+    try:
+        cleanup = cleanup_old_articles(ARTICLE_RETENTION_DAYS, keep_discussed=True)
+        if cleanup["deleted_count"]:
+            logger.info(
+                "Auto-cleaned %d old non-favorite articles older than %d days.",
+                cleanup["deleted_count"],
+                ARTICLE_RETENTION_DAYS,
+            )
+    except Exception:
+        logger.exception("Article auto-cleanup failed")
 
 
 def run_scout(
@@ -27,7 +42,7 @@ def run_scout(
     Returns:
         按启发性评分降序排列的 top_k 篇文章。
     """
-    urls = feed_urls or DEFAULT_FEEDS
+    urls = feed_urls or get_default_feeds()
     logger.info("=== Scout Pipeline Start ===")
 
     with span("scout.pipeline", feed_count=len(urls), top_k=top_k):
@@ -37,6 +52,7 @@ def run_scout(
         raw_articles = fetch_all(urls)
         if not raw_articles:
             logger.warning("No articles fetched. Check feed URLs.")
+            _maybe_cleanup_old_articles(save)
             return []
 
         # 2. Normalize
@@ -49,6 +65,7 @@ def run_scout(
 
         if not new_articles:
             logger.info("No new articles to score. Returning []")
+            _maybe_cleanup_old_articles(save)
             return []
 
         # 3. Score & Rank
@@ -65,6 +82,8 @@ def run_scout(
         if save and result:
             save_articles(result)
             logger.info("Saved %d articles to database.", len(result))
+
+        _maybe_cleanup_old_articles(save)
 
         logger.info("=== Scout Pipeline Done — Top %d selected ===", len(result))
         return result
