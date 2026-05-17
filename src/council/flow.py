@@ -152,15 +152,10 @@ def run_council(
     """
     logger.info("=== Council Session Start: %s ===", title[:50])
 
-    _debate_span = span(
-        "council.debate",
-        article_title=title[:80],
-    )
-    _debate_span_ctx = _debate_span.__enter__
-    # 打开 span（不使用 with，因为我们要在 return 前设置属性后关闭）
+    _debate_span = span("council.debate", article_title=title[:80])
     _s = _debate_span.__enter__()
-
-    state = DebateState(
+    try:
+        state = DebateState(
         article_title=title,
         article_summary=summary,
         article_content=content,
@@ -231,16 +226,17 @@ def run_council(
         state.terminated_by, state.round_idx,
     )
 
-    # 关闭顶层 span，并追加辩论结果属性
-    try:
-        _s.set_attribute("difficulty", state.difficulty or "")
-        _s.set_attribute("terminated_by", state.terminated_by or "")
-        _s.set_attribute("total_rounds", state.round_idx)
-        _s.set_attribute("active_roles", ",".join(state.active_roles))
-        total_tc = sum(t.tool_calls_used for t in state.turns)
-        _s.set_attribute("total_tool_calls", total_tc)
-    except Exception:
-        pass
-    _debate_span.__exit__(None, None, None)
+        # 追加辩论结果属性
+        try:
+            _s.set_attribute("difficulty", state.difficulty or "")
+            _s.set_attribute("terminated_by", state.terminated_by or "")
+            _s.set_attribute("total_rounds", state.round_idx)
+            _s.set_attribute("active_roles", ",".join(state.active_roles))
+            total_tc = sum(t.tool_calls_used for t in state.turns)
+            _s.set_attribute("total_tool_calls", total_tc)
+        except Exception:
+            pass
 
-    return state
+        return state
+    finally:
+        _debate_span.__exit__(None, None, None)
