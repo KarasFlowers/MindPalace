@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import json
 import logging
 import os
 import sys
@@ -12,23 +13,59 @@ if sys.stdout.encoding != "utf-8":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
-import questionary
-from questionary import Style
+try:
+    import questionary
+    from questionary import Style
+except ImportError:
+    class _MissingQuestionaryPrompt:
+        def ask(self):
+            raise RuntimeError(
+                "Interactive mode requires 'questionary'. Run `pip install -e .` first."
+            )
+
+    class _QuestionaryFallback:
+        @staticmethod
+        def select(*args, **kwargs):
+            return _MissingQuestionaryPrompt()
+
+        @staticmethod
+        def text(*args, **kwargs):
+            return _MissingQuestionaryPrompt()
+
+        @staticmethod
+        def confirm(*args, **kwargs):
+            return _MissingQuestionaryPrompt()
+
+        class Separator(str):
+            def __new__(cls, text: str = "----------------"):
+                return str.__new__(cls, text)
+
+    def Style(style_config):
+        return style_config
+
+    questionary = _QuestionaryFallback()
 
 from src.scout.pipeline import run_scout
 from src.council.flow import run_council
 from src.council.output import format_council_result
 from src.storage.db import (
+    add_article_tags,
     cleanup_old_articles,
     get_article,
     list_articles,
+    list_recent_debates_for_article,
+    remove_article_tags,
+    replace_article_tags,
     save_debate,
     set_article_favorite,
+    set_article_note,
 )
+from src.eval.feedback import collect_feedback_interactive
 from src.memory.profiler import profile_response
 from src.memory.store import save_memory, find_related_memories, get_all_memories
 from src.memory.echo import generate_echo_report, format_echo_report
 from src.workflows.daily_session import run_daily_session
+from src.inquiry.cli import run_inquiry_menu
 from src.config import (
     ARTICLE_RETENTION_DAYS,
     FEED_PRESETS,
@@ -120,6 +157,467 @@ def _format_score_bar_plain(score: float, max_score: int = 10) -> str:
     return f"{bar} {score:.1f}/{max_score}"
 
 
+def _parse_tag_text(text: str | None) -> list[str]:
+    if not text:
+        return []
+
+    tags = []
+    seen = set()
+    for candidate in text.replace("，", ",").split(","):
+        tag = candidate.strip()
+        if not tag:
+            continue
+        key = tag.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        tags.append(tag)
+    return tags
+
+
+def _format_tags(tags: list[str] | None) -> str:
+    if not tags:
+        return "无"
+    return " ".join(f"#{tag}" for tag in tags)
+
+
+def _article_filters_from_args(args) -> dict:
+    return {
+        "query": getattr(args, "query", None),
+        "tags": getattr(args, "tag", None) or [],
+        "source": getattr(args, "source", None),
+        "days": getattr(args, "days", None),
+    }
+
+
+def _empty_article_filters() -> dict:
+    return {"query": "", "tags": [], "source": "", "days": None}
+
+
+def _normalize_article_filters(filters: dict | None) -> dict:
+    normalized = _empty_article_filters()
+    if not filters:
+        return normalized
+    normalized["query"] = (filters.get("query") or "").strip()
+    normalized["tags"] = list(filters.get("tags") or [])
+    normalized["source"] = (filters.get("source") or "").strip()
+    normalized["days"] = filters.get("days")
+    return normalized
+
+
+def _has_active_filters(filters: dict | None) -> bool:
+    current = _normalize_article_filters(filters)
+    return any(
+        [
+            current.get("query"),
+            current.get("tags"),
+            current.get("source"),
+            current.get("days") is not None,
+        ]
+    )
+
+
+def _format_filter_summary(filters: dict | None, favorites_only: bool = False) -> str:
+    current = _normalize_article_filters(filters)
+    parts = ["档案库" if favorites_only else "全部文章"]
+    if current["query"]:
+        parts.append(f"关键词={current['query']}")
+    if current["tags"]:
+        parts.append(f"标签={', '.join(current['tags'])}")
+    if current["source"]:
+        parts.append(f"来源={current['source']}")
+    if current["days"] is not None:
+        parts.append(f"近 {current['days']} 天")
+    return " | ".join(parts)
+
+
+def _load_articles_for_filters(limit: int, favorites_only: bool, filters: dict | None) -> list[dict]:
+    current = _normalize_article_filters(filters)
+    return list_articles(
+        limit=limit,
+        favorites_only=favorites_only,
+        query=current["query"] or None,
+        tags=current["tags"],
+        source=current["source"] or None,
+        days=current["days"],
+    )
+
+
+def _print_article_card(article: dict, show_note: bool = True):
+    badges = []
+    if article.get("is_favorite"):
+        badges.append(f"{YELLOW}[收藏]{RESET}")
+    if article.get("tags"):
+        badges.append(f"{GREEN}[已标记]{RESET}")
+    badge_text = f" {' '.join(badges)}" if badges else ""
+
+    print(f"  {BOLD}{CYAN}ID:{article['id']}{RESET}{badge_text} {BOLD}{article['title']}{RESET}")
+    print(
+        f"     {DIM}[SRC] {article['source']}  |  "
+        f"Score: {article['total_score']:.1f}/10  |  "
+        f"Created: {article['created_at'][:10]}{RESET}"
+    )
+    if article.get("tags"):
+        print(f"     {GREEN}Tags: {_format_tags(article.get('tags'))}{RESET}")
+    if show_note and article.get("favorite_note"):
+        print(f"     {YELLOW}Note: {article['favorite_note']}{RESET}")
+    print(f"     {MAGENTA}> {article.get('summary', '')}{RESET}")
+    print(f"     {DIM}{'─' * 50}{RESET}\n")
+
+
+def _print_article_collection(
+    title: str,
+    articles: list[dict],
+    filters: dict | None,
+    favorites_only: bool = False,
+):
+    print(f"\n{BOLD}{CYAN}{'=' * 60}")
+    print(f"  [MindPalace] -- {title}")
+    print(f"{'=' * 60}{RESET}")
+    print(f"  {DIM}{_format_filter_summary(filters, favorites_only=favorites_only)}{RESET}\n")
+    for article in articles:
+        _print_article_card(article)
+
+
+def _print_recent_debate_summary(debate: dict):
+    consensus = debate.get("consensus") or {}
+    headline = consensus.get("headline") or debate.get("article_title") or "未命名讨论"
+    print(f"\n{BOLD}{CYAN}{'=' * 60}")
+    print(f"  [Recent Discussion] #{debate['id']}")
+    print(f"{'=' * 60}{RESET}")
+    print(f"  {BOLD}{headline}{RESET}")
+    print(
+        f"  {DIM}时间: {debate['created_at'][:16]} | 难度: {debate.get('difficulty', '?')} | "
+        f"结束方式: {debate.get('terminated_by', '?')}{RESET}"
+    )
+
+    key_points = consensus.get("key_points") or []
+    if key_points:
+        print(f"\n  {BOLD}{MAGENTA}[核心洞察]{RESET}")
+        for point in key_points[:4]:
+            print(f"  - {point}")
+
+    tensions = consensus.get("remaining_tensions") or []
+    if tensions:
+        print(f"\n  {BOLD}{MAGENTA}[未解决张力]{RESET}")
+        for tension in tensions[:3]:
+            print(f"  - {tension}")
+
+    stance = consensus.get("recommended_stance")
+    if stance:
+        print(f"\n  {BOLD}{MAGENTA}[推荐立场]{RESET}")
+        print(f"  {stance}")
+
+    if not consensus and debate.get("turns"):
+        print(f"\n  {BOLD}{MAGENTA}[讨论片段]{RESET}")
+        for turn in debate["turns"][-3:]:
+            role = turn.get("role_key", "role")
+            raw = turn.get("content")
+            if isinstance(raw, dict):
+                content = json.dumps(raw, ensure_ascii=False)
+            else:
+                content = str(raw or "")
+            print(f"  - {role}: {content[:120]}")
+
+    print(f"\n  {DIM}{'─' * 56}{RESET}")
+
+
+def _show_article_overview(article: dict):
+    print(f"\n{BOLD}{CYAN}{'=' * 60}")
+    print(f"  {article['title']}")
+    print(f"{'=' * 60}{RESET}")
+    print(
+        f"  {DIM}来源: {article['source']} | 评分: {article['total_score']:.1f}/10 | "
+        f"入库: {article['created_at'][:10]}{RESET}"
+    )
+    print(f"  {DIM}链接: {article['url']}{RESET}")
+    if article.get("tags"):
+        print(f"  {GREEN}标签: {_format_tags(article['tags'])}{RESET}")
+    if article.get("favorite_note"):
+        print(f"  {YELLOW}备注: {article['favorite_note']}{RESET}")
+    recent_discussions = list_recent_debates_for_article(article["id"], limit=3)
+    if recent_discussions:
+        latest = recent_discussions[0]
+        headline = (latest.get("consensus") or {}).get("headline") or "有历史讨论可回看"
+        print(f"  {DIM}最近讨论: #{latest['id']} {headline}{RESET}")
+    print(f"\n  {MAGENTA}摘要: {article.get('summary', '')}{RESET}\n")
+    return recent_discussions
+
+
+def _truncate_text(text: str | None, limit: int = 90) -> str:
+    content = (text or "").strip().replace("\n", " ")
+    if len(content) <= limit:
+        return content
+    return content[: limit - 3].rstrip() + "..."
+
+
+def _build_council_snapshot(result) -> dict:
+    """从 Council 结果提取一屏能读完的对话抓手。"""
+    consensus = getattr(result, "consensus", None) or {}
+    critic = getattr(result, "critic", None) or {}
+    synth = getattr(result, "synthesizer", None) or {}
+    mentor = getattr(result, "mentor", None) or {}
+
+    vulnerabilities = critic.get("vulnerabilities") or []
+    first_vulnerability = vulnerabilities[0] if vulnerabilities else {}
+    connections = synth.get("connections") or []
+    first_connection = connections[0] if connections else {}
+    questions = mentor.get("questions") or []
+    first_question = questions[0] if questions else {}
+    key_points = consensus.get("key_points") or []
+
+    summary = consensus.get("headline") or (key_points[0] if key_points else "")
+    if not summary:
+        summary = critic.get("verdict") or synth.get("synthesis") or mentor.get("provocation") or result.article_title
+
+    challenge = ""
+    if first_vulnerability:
+        challenge = first_vulnerability.get("assumption") or first_vulnerability.get("counter") or ""
+    if not challenge:
+        challenge = critic.get("verdict") or "这次讨论里没有形成强烈反驳。"
+
+    bridge = ""
+    if first_connection:
+        bridge = first_connection.get("insight") or first_connection.get("analogy") or ""
+    if not bridge:
+        bridge = synth.get("synthesis") or "这次讨论更偏向直接思辨，没有明显跨界补充。"
+
+    question = ""
+    if first_question:
+        question = first_question.get("question") or ""
+    if not question:
+        question = mentor.get("provocation") or "你最想继续追问哪一点？"
+
+    stance = consensus.get("recommended_stance") or ""
+    return {
+        "summary": _truncate_text(summary, 120),
+        "challenge": _truncate_text(challenge, 120),
+        "bridge": _truncate_text(bridge, 120),
+        "question": _truncate_text(question, 120),
+        "stance": _truncate_text(stance, 120),
+    }
+
+
+def _print_council_snapshot(result):
+    """先给用户一屏内的摘要，再决定要不要展开。"""
+    snapshot = _build_council_snapshot(result)
+    print(f"\n{BOLD}{CYAN}{'=' * 60}")
+    print("  [Council Snapshot] -- 先抓最重要的四点")
+    print(f"{'=' * 60}{RESET}")
+    print(f"  {BOLD}一句话结论{RESET} {snapshot['summary']}")
+    print(f"  {RED}最大争议{RESET} {snapshot['challenge']}")
+    print(f"  {GREEN}新视角{RESET} {snapshot['bridge']}")
+    print(f"  {YELLOW}最值得回应的问题{RESET} {snapshot['question']}")
+    if snapshot["stance"]:
+        print(f"  {MAGENTA}当前建议立场{RESET} {snapshot['stance']}")
+    print()
+
+
+def _print_council_role_detail(role_key: str, payload: dict):
+    """按角色把结构化内容展开成人能快速扫读的形式。"""
+    if role_key == "critic":
+        print(f"\n{BOLD}{RED}[The Critic] -- 展开批判视角{RESET}")
+        vulnerabilities = payload.get("vulnerabilities") or []
+        for item in vulnerabilities[:3]:
+            severity = str(item.get("severity", "?")).upper()
+            print(f"  - [{severity}] {item.get('assumption', '')}")
+            counter = item.get("counter")
+            if counter:
+                print(f"    {DIM}崩塌条件: {counter}{RESET}")
+        if payload.get("missing_counterexample"):
+            print(f"  {MAGENTA}反例: {payload['missing_counterexample']}{RESET}")
+        if payload.get("verdict"):
+            print(f"  {DIM}一句话判断: {payload['verdict']}{RESET}")
+    elif role_key == "synthesizer":
+        print(f"\n{BOLD}{GREEN}[The Synthesizer] -- 展开连接视角{RESET}")
+        connections = payload.get("connections") or []
+        for item in connections[:3]:
+            print(f"  - [{item.get('domain', '?')}] {item.get('analogy', '')}")
+            insight = item.get("insight")
+            if insight:
+                print(f"    {DIM}启发: {insight}{RESET}")
+        if payload.get("synthesis"):
+            print(f"  {DIM}综合洞察: {payload['synthesis']}{RESET}")
+    elif role_key == "mentor":
+        print(f"\n{BOLD}{YELLOW}[The Mentor] -- 展开追问视角{RESET}")
+        questions = payload.get("questions") or []
+        for item in questions[:3]:
+            print(f"  - [{item.get('level', '追问')}] {item.get('question', '')}")
+        if payload.get("provocation"):
+            print(f"  {MAGENTA}刺激点: {payload['provocation']}{RESET}")
+    print(f"\n  {DIM}{'─' * 56}{RESET}\n")
+
+
+def _offer_council_deep_dive(result):
+    """用户按需展开某个视角，而不是默认吃下全部长文。"""
+    critic = getattr(result, "critic", None) or {}
+    synth = getattr(result, "synthesizer", None) or {}
+    mentor = getattr(result, "mentor", None) or {}
+
+    while True:
+        print(
+            f"{DIM}想继续展开哪一部分？"
+            f" [1] 批判视角 [2] 连接视角 [3] 追问视角 [4] 完整讨论 [Enter] 继续回应{RESET}"
+        )
+        try:
+            choice = input(f"  {GREEN}>{RESET} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if choice in ("", "c", "continue"):
+            return
+        if choice == "1":
+            _print_council_role_detail("critic", critic)
+        elif choice == "2":
+            _print_council_role_detail("synthesizer", synth)
+        elif choice == "3":
+            _print_council_role_detail("mentor", mentor)
+        elif choice == "4":
+            print(format_council_result(result, colors=COLORS))
+        else:
+            print(f"{YELLOW}请输入 1/2/3/4，或直接回车继续。{RESET}")
+
+
+def _collect_guided_user_response() -> str | None:
+    """用回应模板降低用户开口成本。"""
+    starters = {
+        "1": "我同意这里最有说服力的一点，因为",
+        "2": "我不同意这里的一个关键前提，因为",
+        "3": "我现在最困惑的问题是",
+        "4": "这让我想到另一个案例：",
+        "5": "请继续追问我这个点：",
+    }
+
+    print(f"  {BOLD}{CYAN}{'=' * 60}")
+    print("  [Your Turn] -- 选一个起手句，更容易开口")
+    print(f"  {'=' * 60}{RESET}")
+    print("  [1] 我同意，因为...")
+    print("  [2] 我不同意，因为...")
+    print("  [3] 我最困惑的是...")
+    print("  [4] 这让我想到...")
+    print("  [5] 请继续追问我...")
+    print("  [Enter] 自由输入  [skip] 跳过")
+    print(f"  {DIM}输入内容后，连续两次回车提交。{RESET}\n")
+
+    try:
+        choice = input(f"  {GREEN}>{RESET} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+    if choice == "skip":
+        return None
+
+    starter = starters.get(choice)
+    lines: list[str] = []
+    blank_count = 0
+    first_input = True
+
+    while True:
+        try:
+            line = input(f"  {GREEN}>{RESET} ")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+
+        if first_input and line.strip().lower() == "skip":
+            return None
+
+        if first_input and starter:
+            lines.append(f"{starter}{line.strip()}" if line.strip() else starter)
+            first_input = False
+            continue
+
+        first_input = False
+        if line == "":
+            blank_count += 1
+            if blank_count >= 2:
+                break
+            continue
+
+        blank_count = 0
+        lines.append(line)
+
+    user_response = "\n".join(lines).strip()
+    return user_response or None
+
+
+def _process_council_reflection(article: dict, user_response: str):
+    """把用户回应接到记忆与 echo 流程里。"""
+    print(f"\n  {DIM}Analyzing your cognitive pattern...{RESET}")
+    mem_cfg = get_memory_config()
+    profile = profile_response(
+        user_response=user_response,
+        article_title=article["title"],
+        article_summary=article.get("summary", ""),
+        provider_config=mem_cfg,
+    )
+
+    print(f"\n  {BOLD}{MAGENTA}[Cognitive Profile]{RESET}")
+    print(f"    Preference:  {', '.join(profile.core_preference)}")
+    print(f"    Reasoning:   {profile.reasoning_style}")
+    print(f"    Tone:        {profile.emotional_tone}")
+    print(f"    Stance:      {profile.stance_summary}")
+    print(f"    Keywords:    {', '.join(profile.topic_keywords)}")
+
+    memory_id = save_memory(
+        article_id=article.get("id"),
+        article_title=article["title"],
+        user_response=user_response,
+        profile=profile,
+    )
+    print(f"  {DIM}Memory saved (#{memory_id}){RESET}")
+
+    related = find_related_memories(user_response, exclude_id=memory_id)
+    current_tags = {
+        "core_preference": profile.core_preference,
+        "reasoning_style": profile.reasoning_style,
+        "emotional_tone": profile.emotional_tone,
+        "stance_summary": profile.stance_summary,
+    }
+    echo = generate_echo_report(user_response, current_tags, related, provider_config=mem_cfg)
+    print(format_echo_report(echo, colors=COLORS))
+
+
+def _run_council_experience(article: dict, pause_at_end: bool = False, paradigm: str = "debate"):
+    """统一 Council 的展示、回应和反馈体验。"""
+    print(f"\n{BOLD}Starting Council discussion for: {article['title']}{RESET}\n")
+
+    cfg = get_council_config()
+    result = run_council(
+        title=article["title"],
+        summary=article.get("summary", ""),
+        content=article.get("summary", ""),
+        provider_config=cfg,
+        paradigm=paradigm,
+    )
+
+    debate_id = None
+    try:
+        debate_id = save_debate(result, article_id=article.get("id"))
+    except Exception:
+        logging.getLogger(__name__).exception("Failed to persist debate state")
+
+    _print_council_snapshot(result)
+    _offer_council_deep_dive(result)
+
+    user_response = _collect_guided_user_response()
+    if user_response:
+        _process_council_reflection(article, user_response)
+    else:
+        print(f"\n  {DIM}No response recorded this time.{RESET}\n")
+
+    if debate_id is not None:
+        try:
+            collect_feedback_interactive(debate_id)
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to collect council feedback")
+
+    if pause_at_end:
+        input(f"\n{DIM}按 Enter 继续...{RESET}")
+
+
 def _display_results(articles):
     """以富文本格式展示评分结果。"""
     if not articles:
@@ -160,22 +658,19 @@ def cmd_scout(args):
 
 def cmd_list(args):
     """列出数据库中的文章。"""
-    articles = list_articles(limit=args.limit)
+    filters = _article_filters_from_args(args)
+    if filters["days"] is not None and filters["days"] < 1:
+        print(f"\n{RED}--days 必须大于等于 1。{RESET}\n")
+        return
+    articles = _load_articles_for_filters(limit=args.limit, favorites_only=False, filters=filters)
     if not articles:
-        print(f"\n{YELLOW}数据库中暂无文章。请先运行 scout 命令。{RESET}")
+        if _has_active_filters(filters):
+            print(f"\n{YELLOW}当前筛选下没有文章：{_format_filter_summary(filters)}{RESET}\n")
+        else:
+            print(f"\n{YELLOW}数据库中暂无文章。请先运行 scout 命令。{RESET}\n")
         return
 
-    print(f"\n{BOLD}{CYAN}{'=' * 60}")
-    print(f"  [MindPalace] -- Saved Articles")
-    print(f"{'=' * 60}{RESET}\n")
-
-    for a in articles:
-        scores = a.get("scores", {})
-        favorite = f" {YELLOW}[收藏]{RESET}" if a.get("is_favorite") else ""
-        print(f"  {BOLD}{CYAN}ID:{a['id']}{RESET}{favorite} {BOLD}{a['title']}{RESET}")
-        print(f"     {DIM}[SRC] {a['source']}  |  Score: {a['total_score']:.1f}/10{RESET}")
-        print(f"     {MAGENTA}> {a.get('summary', '')}{RESET}")
-        print(f"     {DIM}{'─' * 50}{RESET}\n")
+    _print_article_collection("Saved Articles", articles, filters)
 
 
 def cmd_favorite(args):
@@ -186,7 +681,15 @@ def cmd_favorite(args):
         return
 
     set_article_favorite(args.item, favorite=True, note=args.note)
-    print(f"\n{GREEN}已收藏：{article['title']}{RESET}\n")
+    if args.tags:
+        add_article_tags(args.item, args.tags)
+    article = get_article(args.item)
+    print(f"\n{GREEN}已收藏：{article['title']}{RESET}")
+    if article and article.get("tags"):
+        print(f"{GREEN}标签：{_format_tags(article['tags'])}{RESET}")
+    if article and article.get("favorite_note"):
+        print(f"{YELLOW}备注：{article['favorite_note']}{RESET}")
+    print()
 
 
 def cmd_unfavorite(args):
@@ -202,23 +705,57 @@ def cmd_unfavorite(args):
 
 def cmd_favorites(args):
     """列出收藏夹文章。"""
-    articles = list_articles(limit=args.limit, favorites_only=True)
+    filters = _article_filters_from_args(args)
+    if filters["days"] is not None and filters["days"] < 1:
+        print(f"\n{RED}--days 必须大于等于 1。{RESET}\n")
+        return
+    articles = _load_articles_for_filters(limit=args.limit, favorites_only=True, filters=filters)
     if not articles:
-        print(f"\n{YELLOW}收藏夹还没有文章。看到值得反复讨论的材料，可以用 favorite 收藏。{RESET}")
+        if _has_active_filters(filters):
+            print(f"\n{YELLOW}当前筛选下没有档案文章：{_format_filter_summary(filters, favorites_only=True)}{RESET}\n")
+        else:
+            print(f"\n{YELLOW}收藏夹还没有文章。看到值得反复讨论的材料，可以用 favorite 收藏。{RESET}\n")
         return
 
-    print(f"\n{BOLD}{CYAN}{'=' * 60}")
-    print(f"  [MindPalace] -- Favorites")
-    print(f"{'=' * 60}{RESET}\n")
+    _print_article_collection("Personal Archive", articles, filters, favorites_only=True)
 
-    for a in articles:
-        note = a.get("favorite_note")
-        print(f"  {BOLD}{CYAN}ID:{a['id']}{RESET} {BOLD}{a['title']}{RESET}")
-        print(f"     {DIM}[SRC] {a['source']}  |  Score: {a['total_score']:.1f}/10{RESET}")
-        if note:
-            print(f"     {YELLOW}Note: {note}{RESET}")
-        print(f"     {MAGENTA}> {a.get('summary', '')}{RESET}")
-        print(f"     {DIM}{'─' * 50}{RESET}\n")
+
+def cmd_note(args):
+    """编辑文章备注。"""
+    article = get_article(args.item)
+    if not article:
+        print(f"\n{RED}Article ID {args.item} not found. Use 'list' to see available articles.{RESET}")
+        return
+
+    note = None if args.clear else args.text
+    set_article_note(args.item, note)
+    article = get_article(args.item)
+    if args.clear:
+        print(f"\n{YELLOW}已清空备注：{article['title']}{RESET}\n")
+    else:
+        print(f"\n{GREEN}已更新备注：{article['title']}{RESET}")
+        print(f"{YELLOW}{article.get('favorite_note', '')}{RESET}\n")
+
+
+def cmd_tag(args):
+    """编辑文章标签。"""
+    article = get_article(args.item)
+    if not article:
+        print(f"\n{RED}Article ID {args.item} not found. Use 'list' to see available articles.{RESET}")
+        return
+
+    if args.clear:
+        replace_article_tags(args.item, [])
+    elif args.set is not None:
+        replace_article_tags(args.item, args.set)
+    elif args.add is not None:
+        add_article_tags(args.item, args.add)
+    elif args.remove is not None:
+        remove_article_tags(args.item, args.remove)
+
+    updated = get_article(args.item)
+    print(f"\n{GREEN}已更新标签：{updated['title']}{RESET}")
+    print(f"{GREEN}当前标签：{_format_tags(updated.get('tags'))}{RESET}\n")
 
 
 def cmd_cleanup(args):
@@ -231,6 +768,7 @@ def cmd_cleanup(args):
         retention_days=args.days,
         dry_run=args.dry_run,
         keep_discussed=not args.include_discussed,
+        keep_tagged=not args.include_tagged,
     )
 
     action = "可清理" if args.dry_run else "已清理"
@@ -238,6 +776,7 @@ def cmd_cleanup(args):
     print(f"\n{BOLD}{CYAN}[Article Cleanup]{RESET}")
     print(f"  保留天数: {args.days}")
     print(f"  收藏文章: 永远保留")
+    print(f"  已打标签文章: {'也会清理' if args.include_tagged else '默认保留'}")
     print(f"  已讨论/已记忆文章: {'也会清理' if args.include_discussed else '默认保留'}")
     print(f"  {action}: {count} 篇\n")
 
@@ -266,8 +805,27 @@ def cmd_view(args):
     print(f"  {DIM}来源: {article['source']}{RESET}")
     print(f"  {DIM}链接: {article['url']}{RESET}")
     print(f"  {DIM}评分: {article['total_score']:.1f}/10{RESET}")
+    if article.get("tags"):
+        print(f"  {GREEN}标签: {_format_tags(article['tags'])}{RESET}")
+    if article.get("favorite_note"):
+        print(f"  {YELLOW}备注: {article['favorite_note']}{RESET}")
+
+    recent_debates = list_recent_debates_for_article(article["id"], limit=2)
+    if recent_debates:
+        latest = recent_debates[0]
+        headline = (latest.get("consensus") or {}).get("headline") or "可回看历史讨论"
+        print(f"  {DIM}最近讨论: #{latest['id']} {headline}{RESET}")
+
     print(f"\n  {BOLD}{MAGENTA}[摘要]{RESET}")
     print(f"  {article.get('summary', '')}")
+
+    if recent_debates:
+        print(f"\n  {BOLD}{MAGENTA}[最近讨论摘要]{RESET}")
+        consensus = recent_debates[0].get("consensus") or {}
+        key_points = consensus.get("key_points") or []
+        for point in key_points[:3]:
+            print(f"  - {point}")
+
     print(f"\n  {BOLD}{MAGENTA}[正文]{RESET}")
     
     # 从数据库读取的是 clean_content（已清洗的纯文本）
@@ -343,86 +901,8 @@ def cmd_council(args):
         print(f"\n{RED}Article ID {args.item} not found. Use 'list' to see available articles.{RESET}")
         return
 
-    print(f"\n{BOLD}Starting Council discussion for: {article['title']}{RESET}\n")
-
-    cfg = get_council_config()
-    result = run_council(
-        title=article["title"],
-        summary=article.get("summary", ""),
-        content=article.get("summary", ""),
-        provider_config=cfg,
-    )
-
-    try:
-        save_debate(result, article_id=article.get("id"))
-    except Exception:
-        logging.getLogger(__name__).exception("Failed to persist debate state")
-
-    output = format_council_result(result, colors=COLORS)
-    print(output)
-
-    # 收集用户回应
-    print(f"  {BOLD}{CYAN}{'=' * 60}")
-    print(f"  [Your Turn] -- Share Your Thoughts")
-    print(f"  {'=' * 60}{RESET}")
-    print(f"  {DIM}(Enter your response. Press Enter twice to submit, or type 'skip' to skip){RESET}\n")
-
-    lines = []
-    while True:
-        try:
-            line = input(f"  {GREEN}>{RESET} ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if line.strip().lower() == "skip":
-            print(f"\n  {DIM}Skipped. Your thoughts are your own.{RESET}\n")
-            return
-        if line == "" and lines and lines[-1] == "":
-            break
-        lines.append(line)
-
-    user_response = "\n".join(lines).strip()
-    if not user_response:
-        print(f"\n  {DIM}No response recorded.{RESET}\n")
-        return
-
-    # Cognitive Profiling
-    print(f"\n  {DIM}Analyzing your cognitive pattern...{RESET}")
-    mem_cfg = get_memory_config()
-    profile = profile_response(
-        user_response=user_response,
-        article_title=article["title"],
-        article_summary=article.get("summary", ""),
-        provider_config=mem_cfg,
-    )
-
-    # 显示画像标签
-    print(f"\n  {BOLD}{MAGENTA}[Cognitive Profile]{RESET}")
-    print(f"    Preference:  {', '.join(profile.core_preference)}")
-    print(f"    Reasoning:   {profile.reasoning_style}")
-    print(f"    Tone:        {profile.emotional_tone}")
-    print(f"    Stance:      {profile.stance_summary}")
-    print(f"    Keywords:    {', '.join(profile.topic_keywords)}")
-
-    # 保存记忆
-    memory_id = save_memory(
-        article_id=args.item,
-        article_title=article["title"],
-        user_response=user_response,
-        profile=profile,
-    )
-    print(f"  {DIM}Memory saved (#{memory_id}){RESET}")
-
-    # Echo Location
-    related = find_related_memories(user_response, exclude_id=memory_id)
-    current_tags = {
-        "core_preference": profile.core_preference,
-        "reasoning_style": profile.reasoning_style,
-        "emotional_tone": profile.emotional_tone,
-        "stance_summary": profile.stance_summary,
-    }
-    echo = generate_echo_report(user_response, current_tags, related, provider_config=mem_cfg)
-    print(format_echo_report(echo, colors=COLORS))
+    paradigm = getattr(args, "paradigm", "debate")
+    _run_council_experience(article, pause_at_end=False, paradigm=paradigm)
 
 
 def cmd_reflect(args):
@@ -761,6 +1241,7 @@ def interactive_menu():
             choices=[
                 "🚀 今日练习",
                 "📚 文章库",
+                "🧭 心智漫游",
                 "💬 深度对话",
                 "🧠 认知回顾",
                 "⚙️  设置",
@@ -779,6 +1260,8 @@ def interactive_menu():
                 run_daily_session()
             elif action.startswith("📚"):
                 _interactive_library()
+            elif action.startswith("🧭"):
+                run_inquiry_menu()
             elif action.startswith("💬"):
                 _interactive_resolve()
             elif action.startswith("🧠"):
@@ -801,7 +1284,7 @@ def _interactive_library():
             choices=[
                 "🎯 发现新文章",
                 "📚 浏览文章",
-                "⭐ 收藏夹",
+                "⭐ 档案库",
                 "🧹 清理旧文章",
                 questionary.Separator(),
                 "🔙 返回主菜单",
@@ -833,6 +1316,8 @@ def _interactive_cognition():
             "认知回顾：",
             choices=[
                 "🧠 查看认知历史",
+                "💎 查看认知洞察",
+                "📦 导出认知档案",
                 "📊 周度评估报告",
                 questionary.Separator(),
                 "🔙 返回主菜单",
@@ -846,11 +1331,75 @@ def _interactive_cognition():
         try:
             if action.startswith("🧠"):
                 _interactive_memory()
+            elif action.startswith("💎"):
+                _interactive_crystals()
+            elif action.startswith("📦"):
+                _interactive_export_brain()
             elif action.startswith("📊"):
                 _interactive_eval()
         except KeyboardInterrupt:
             print(f"\n{DIM}操作已取消{RESET}\n")
             return
+
+
+def _interactive_crystals():
+    """展示已结晶的结构化认知洞察。"""
+    from src.storage.db import list_crystals
+    from src.memory.crystallize import render_crystal_terminal
+
+    crystals = list_crystals(limit=50)
+    if not crystals:
+        print(f"\n{YELLOW}还没有认知洞察。多参与 Council 辩论或心智漫游，积累足够后会自动结晶。{RESET}\n")
+        return
+
+    print(f"\n{BOLD}{MAGENTA}{'=' * 60}")
+    print(f"  [Cognitive Crystals] -- 认知洞察（共 {len(crystals)} 条）")
+    print(f"{'=' * 60}{RESET}\n")
+
+    for cr in crystals:
+        crystal_dict = {
+            "type": cr.get("type", "observation"),
+            "content": cr.get("content", ""),
+            "confidence": cr.get("confidence", 0.0),
+            "reasoning": "",
+            "tags": cr.get("tags", []),
+            "sources": cr.get("sources", []),
+            "status": cr.get("status", "candidate"),
+        }
+        print(render_crystal_terminal(crystal_dict, colors=COLORS))
+        print(f"  {DIM}{cr.get('created_at', '')[:10]}{RESET}")
+        print(f"  {DIM}{'─' * 54}{RESET}\n")
+
+    try:
+        input(f"{DIM}按 Enter 继续...{RESET}")
+    except EOFError:
+        return
+
+
+def _interactive_export_brain():
+    """将认知洞察导出为 Markdown brain 目录。"""
+    from src.memory.brain_export import export_brain
+
+    try:
+        count = export_brain()
+    except Exception as exc:
+        print(f"\n{RED}导出失败: {exc}{RESET}\n")
+        return
+
+    if count == 0:
+        print(f"\n{YELLOW}还没有认知洞察可导出。{RESET}\n")
+        return
+
+    print(f"\n{GREEN}✓ 已导出 {count} 条认知洞察到 data/brain/ 目录{RESET}")
+    print(f"{DIM}  ├─ axioms/        （身份级信念）")
+    print(f"  ├─ principles/    （可复用规则）")
+    print(f"  └─ observations/  （日常观察）{RESET}")
+    print(f"\n{DIM}文件带 YAML frontmatter，可用 Obsidian 打开。{RESET}\n")
+
+    try:
+        input(f"{DIM}按 Enter 继续...{RESET}")
+    except EOFError:
+        return
 
 
 def _interactive_scout():
@@ -875,86 +1424,270 @@ def _interactive_scout():
     _display_results(results)
 
 
-def _interactive_list(favorites_only: bool = False):
-    """交互式 List - 整合 View 和 Brief 功能。"""
-    articles = list_articles(limit=20, favorites_only=favorites_only)
-    if not articles:
-        if favorites_only:
-            print(f"\n{YELLOW}收藏夹还没有文章。可以先在 Browse 里收藏高价值文章。{RESET}\n")
-        else:
-            print(f"\n{YELLOW}数据库中暂无文章。请先运行 Scout。{RESET}\n")
+def _prompt_article_filters(current_filters: dict | None) -> dict:
+    """交互式设置文章筛选。"""
+    current = _normalize_article_filters(current_filters)
+    print(f"\n{DIM}留空表示不筛选；标签请用逗号分隔。{RESET}")
+
+    query = questionary.text(
+        "关键词（标题/摘要/备注/标签）：",
+        default=current["query"],
+        style=custom_style,
+    ).ask()
+    if query is None:
+        return current
+
+    tag_text = questionary.text(
+        "标签：",
+        default=", ".join(current["tags"]),
+        style=custom_style,
+    ).ask()
+    if tag_text is None:
+        return current
+
+    source = questionary.text(
+        "来源关键词：",
+        default=current["source"],
+        style=custom_style,
+    ).ask()
+    if source is None:
+        return current
+
+    days_text = questionary.text(
+        "最近几天（留空不限）：",
+        default="" if current["days"] is None else str(current["days"]),
+        style=custom_style,
+    ).ask()
+    if days_text is None:
+        return current
+
+    days = None
+    if days_text.strip():
+        try:
+            days = int(days_text.strip())
+        except ValueError:
+            print(f"\n{RED}最近天数必须是数字。将保留原筛选条件。{RESET}\n")
+            return current
+        if days < 1:
+            print(f"\n{RED}最近天数必须大于等于 1。将保留原筛选条件。{RESET}\n")
+            return current
+
+    return {
+        "query": query.strip(),
+        "tags": _parse_tag_text(tag_text),
+        "source": source.strip(),
+        "days": days,
+    }
+
+
+def _show_recent_discussions(article: dict):
+    """查看某篇文章最近的讨论记录。"""
+    debates = list_recent_debates_for_article(article["id"], limit=5)
+    if not debates:
+        print(f"\n{YELLOW}这篇文章还没有历史讨论。可以先发起一次议事厅讨论。{RESET}\n")
+        input(f"{DIM}按 Enter 继续...{RESET}")
         return
 
-    # 构建选择列表（纯文本，无颜色代码）
     choices = []
-    for a in articles:
-        score_bar = _format_score_bar_plain(a['total_score'])
-        # 截断标题避免过长
-        title = a['title'][:50] + "..." if len(a['title']) > 50 else a['title']
-        favorite_mark = "[收藏] " if a.get("is_favorite") else ""
-        choice_text = f"[ID:{a['id']}] {favorite_mark}{title} {score_bar}"
-        choices.append(choice_text)
-    
-    choices.append(questionary.Separator())
-    choices.append("🔙 返回主菜单")
-    
+    for debate in debates:
+        headline = (debate.get("consensus") or {}).get("headline") or debate.get("article_title", "")
+        title = headline[:42] + "..." if len(headline) > 42 else headline
+        choices.append(f"[#{debate['id']}] {debate['created_at'][:10]} {title}")
+    choices.extend([questionary.Separator(), "🔙 返回"])
+
     selected = questionary.select(
-        "选择文章：",
+        "选择要回看的讨论：",
         choices=choices,
-        style=custom_style
+        style=custom_style,
     ).ask()
-    
+
     if not selected or selected.startswith("🔙"):
         return
-    
-    # 提取文章 ID
-    article_id = int(selected.split("]")[0].split(":")[1])
-    article = get_article(article_id)
-    
-    if not article:
-        print(f"\n{RED}文章不存在。{RESET}\n")
+
+    debate_id = int(selected.split("]")[0].strip("[#"))
+    debate = next((item for item in debates if item["id"] == debate_id), None)
+    if not debate:
         return
-    
-    # 显示文章基本信息（这里可以用颜色）
-    print(f"\n{BOLD}{CYAN}{'=' * 60}")
-    print(f"  {article['title']}")
-    print(f"{'=' * 60}{RESET}")
-    print(f"  {DIM}来源: {article['source']} | 评分: {article['total_score']:.1f}/10{RESET}")
-    print(f"  {DIM}链接: {article['url']}{RESET}\n")
-    print(f"  {MAGENTA}摘要: {article.get('summary', '')}{RESET}\n")
-    
-    # 选择操作
-    action = questionary.select(
-        "你想做什么？",
-        choices=[
-            "📖 生成导读精炼版",
-            "🌐 查看原文（浏览器打开）",
-            "🏛️  发起议事厅讨论",
-            "⭐ 取消收藏" if article.get("is_favorite") else "⭐ 收藏到收藏夹",
-            questionary.Separator(),
-            "🔙 返回文章列表"
-        ],
-        style=custom_style
+
+    _print_recent_debate_summary(debate)
+    input(f"{DIM}按 Enter 继续...{RESET}")
+
+
+def _interactive_edit_note(article: dict):
+    """交互式编辑文章备注。"""
+    note = questionary.text(
+        "输入备注（留空表示清空）：",
+        default=article.get("favorite_note") or "",
+        style=custom_style,
     ).ask()
-    
-    if not action or action.startswith("🔙"):
-        _interactive_list(favorites_only=favorites_only)  # 递归返回列表
+    if note is None:
         return
-    
-    if action.startswith("📖"):
-        _show_brief(article)
-        _interactive_list(favorites_only=favorites_only)  # 操作完成后返回列表
-    elif action.startswith("🌐"):
-        _open_in_browser(article)
-        _interactive_list(favorites_only=favorites_only)
-    elif action.startswith("🏛️"):
-        _start_council(article)
-    elif action.startswith("⭐"):
-        set_article_favorite(article["id"], favorite=not article.get("is_favorite"))
-        status = "已收藏" if not article.get("is_favorite") else "已取消收藏"
-        print(f"\n{GREEN if not article.get('is_favorite') else YELLOW}{status}: {article['title']}{RESET}\n")
-        input(f"{DIM}按 Enter 继续...{RESET}")
-        _interactive_list(favorites_only=favorites_only)
+
+    set_article_note(article["id"], note)
+    updated = get_article(article["id"])
+    if updated and updated.get("favorite_note"):
+        print(f"\n{GREEN}已更新备注。{RESET}")
+        print(f"{YELLOW}{updated['favorite_note']}{RESET}\n")
+    else:
+        print(f"\n{YELLOW}已清空备注。{RESET}\n")
+    input(f"{DIM}按 Enter 继续...{RESET}")
+
+
+def _interactive_edit_tags(article: dict):
+    """交互式编辑文章标签。"""
+    tag_text = questionary.text(
+        "输入标签（逗号分隔，留空表示清空）：",
+        default=", ".join(article.get("tags") or []),
+        style=custom_style,
+    ).ask()
+    if tag_text is None:
+        return
+
+    replace_article_tags(article["id"], _parse_tag_text(tag_text))
+    updated = get_article(article["id"])
+    print(f"\n{GREEN}已更新标签：{_format_tags(updated.get('tags'))}{RESET}\n")
+    input(f"{DIM}按 Enter 继续...{RESET}")
+
+
+def _interactive_list(favorites_only: bool = False, filters: dict | None = None):
+    """交互式文章库，支持筛选、收藏、标签、备注和历史讨论。"""
+    current_filters = _normalize_article_filters(filters)
+    empty_message = (
+        "收藏档案里还没有文章。可以先在 Browse 里收藏或打标签。"
+        if favorites_only
+        else "数据库中暂无文章。请先运行 Scout。"
+    )
+
+    while True:
+        articles = _load_articles_for_filters(
+            limit=20, favorites_only=favorites_only, filters=current_filters
+        )
+
+        if not articles:
+            if not _has_active_filters(current_filters):
+                print(f"\n{YELLOW}{empty_message}{RESET}\n")
+                return
+
+            print(
+                f"\n{YELLOW}当前筛选下没有文章："
+                f"{_format_filter_summary(current_filters, favorites_only)}{RESET}\n"
+            )
+            action = questionary.select(
+                "你想怎么做？",
+                choices=["🔎 调整筛选", "🧹 清空筛选", "🔙 返回主菜单"],
+                style=custom_style,
+            ).ask()
+            if action and action.startswith("🔎"):
+                current_filters = _prompt_article_filters(current_filters)
+                continue
+            if action and action.startswith("🧹"):
+                current_filters = _empty_article_filters()
+                continue
+            return
+
+        print(
+            f"\n{BOLD}{CYAN}[文章筛选]{RESET} "
+            f"{_format_filter_summary(current_filters, favorites_only)}\n"
+        )
+
+        choices = []
+        for article in articles:
+            score_bar = _format_score_bar_plain(article["total_score"])
+            title = (
+                article["title"][:46] + "..."
+                if len(article["title"]) > 46
+                else article["title"]
+            )
+            archive_mark = (
+                "[收藏] " if article.get("is_favorite")
+                else "[标签] " if article.get("tags")
+                else ""
+            )
+            note_mark = " 📝" if article.get("favorite_note") else ""
+            tag_preview = ""
+            if article.get("tags"):
+                preview_tags = " ".join(f"#{tag}" for tag in article["tags"][:2])
+                tag_preview = f" {preview_tags}"
+            choices.append(
+                f"[ID:{article['id']}] {archive_mark}{title} "
+                f"{score_bar}{note_mark}{tag_preview}"
+            )
+
+        choices.append(questionary.Separator())
+        choices.append("🔎 设置筛选")
+        if _has_active_filters(current_filters):
+            choices.append("🧹 清空筛选")
+        choices.append("🔙 返回主菜单")
+
+        selected = questionary.select(
+            "选择文章：",
+            choices=choices,
+            style=custom_style,
+        ).ask()
+
+        if not selected:
+            return
+        if selected.startswith("🔎"):
+            current_filters = _prompt_article_filters(current_filters)
+            continue
+        if selected.startswith("🧹"):
+            current_filters = _empty_article_filters()
+            continue
+        if selected.startswith("🔙"):
+            return
+
+        article_id = int(selected.split("]")[0].split(":")[1])
+        article = get_article(article_id)
+        if not article:
+            print(f"\n{RED}文章不存在。{RESET}\n")
+            continue
+
+        recent_discussions = _show_article_overview(article)
+        action = questionary.select(
+            "你想做什么？",
+            choices=[
+                "📖 生成导读精炼版",
+                "🌐 查看原文（浏览器打开）",
+                "🏛️  发起议事厅讨论",
+                f"🕘 查看最近讨论（{len(recent_discussions)}）",
+                (
+                    "⭐ 取消收藏"
+                    if article.get("is_favorite")
+                    else "⭐ 收藏到收藏夹"
+                ),
+                "📝 编辑备注",
+                "🏷️ 编辑标签",
+                questionary.Separator(),
+                "🔙 返回文章列表",
+            ],
+            style=custom_style,
+        ).ask()
+
+        if not action or action.startswith("🔙"):
+            continue
+
+        if action.startswith("📖"):
+            _show_brief(article)
+        elif action.startswith("🌐"):
+            _open_in_browser(article)
+        elif action.startswith("🏛️"):
+            _start_council(article)
+        elif action.startswith("🕘"):
+            _show_recent_discussions(article)
+        elif action.startswith("⭐"):
+            set_article_favorite(
+                article["id"], favorite=not article.get("is_favorite")
+            )
+            status = (
+                "已收藏" if not article.get("is_favorite") else "已取消收藏"
+            )
+            color = GREEN if not article.get("is_favorite") else YELLOW
+            print(f"\n{color}{status}: {article['title']}{RESET}\n")
+            input(f"{DIM}按 Enter 继续...{RESET}")
+        elif action.startswith("📝"):
+            _interactive_edit_note(article)
+        elif action.startswith("🏷️"):
+            _interactive_edit_tags(article)
 
 
 def _show_brief(article):
@@ -1031,88 +1764,8 @@ def _open_in_browser(article):
 
 def _start_council(article):
     """发起议事厅讨论。"""
-    print(f"\n{BOLD}Starting Council discussion for: {article['title']}{RESET}\n")
-
-    cfg = get_council_config()
-    result = run_council(
-        title=article["title"],
-        summary=article.get("summary", ""),
-        content=article.get("summary", ""),
-        provider_config=cfg,
-    )
-
-    try:
-        save_debate(result, article_id=article.get("id"))
-    except Exception:
-        logging.getLogger(__name__).exception("Failed to persist debate state")
-
-    output = format_council_result(result, colors=COLORS)
-    print(output)
-
-    # 收集用户回应
-    print(f"  {BOLD}{CYAN}{'=' * 60}")
-    print(f"  [Your Turn] -- Share Your Thoughts")
-    print(f"  {'=' * 60}{RESET}")
-    print(f"  {DIM}(Enter your response. Press Enter twice to submit, or type 'skip' to skip){RESET}\n")
-
-    lines = []
-    while True:
-        try:
-            line = input(f"  {GREEN}>{RESET} ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if line.strip().lower() == "skip":
-            print(f"\n  {DIM}Skipped. Your thoughts are your own.{RESET}\n")
-            return
-        if line == "" and lines and lines[-1] == "":
-            break
-        lines.append(line)
-
-    user_response = "\n".join(lines).strip()
-    if not user_response:
-        print(f"\n  {DIM}No response recorded.{RESET}\n")
-        return
-
-    # Cognitive Profiling
-    print(f"\n  {DIM}Analyzing your cognitive pattern...{RESET}")
-    mem_cfg = get_memory_config()
-    profile = profile_response(
-        user_response=user_response,
-        article_title=article["title"],
-        article_summary=article.get("summary", ""),
-        provider_config=mem_cfg,
-    )
-
-    # 显示画像标签
-    print(f"\n  {BOLD}{MAGENTA}[Cognitive Profile]{RESET}")
-    print(f"    Preference:  {', '.join(profile.core_preference)}")
-    print(f"    Reasoning:   {profile.reasoning_style}")
-    print(f"    Tone:        {profile.emotional_tone}")
-    print(f"    Stance:      {profile.stance_summary}")
-    print(f"    Keywords:    {', '.join(profile.topic_keywords)}")
-
-    # 保存记忆
-    memory_id = save_memory(
-        article_id=article['id'],
-        article_title=article["title"],
-        user_response=user_response,
-        profile=profile,
-    )
-    print(f"  {DIM}Memory saved (#{memory_id}){RESET}")
-
-    # Echo Location
-    related = find_related_memories(user_response, exclude_id=memory_id)
-    current_tags = {
-        "core_preference": profile.core_preference,
-        "reasoning_style": profile.reasoning_style,
-        "emotional_tone": profile.emotional_tone,
-        "stance_summary": profile.stance_summary,
-    }
-    echo = generate_echo_report(user_response, current_tags, related, provider_config=mem_cfg)
-    print(format_echo_report(echo, colors=COLORS))
-    
-    input(f"\n{DIM}按 Enter 继续...{RESET}")
+    paradigm = _prompt_paradigm()
+    _run_council_experience(article, pause_at_end=True, paradigm=paradigm)
 
 
 def _interactive_view():
@@ -1128,6 +1781,28 @@ def _interactive_brief():
 def _interactive_council():
     """交互式 Council - 已整合到 List 中。"""
     print(f"\n{YELLOW}此功能已整合到 List 中，请使用 List 功能选择文章后发起讨论。{RESET}\n")
+
+
+def _prompt_paradigm() -> str:
+    """交互式选择讨论范式。"""
+    try:
+        choice = questionary.select(
+            "选择讨论范式:",
+            choices=[
+                questionary.Choice(
+                    title="🥊 辩论 (Debate) — 对抗式多轮反驳",
+                    value="debate",
+                ),
+                questionary.Choice(
+                    title="📝 报告 (Report) — 中心化起草 + 审阅",
+                    value="report",
+                ),
+            ],
+            use_arrow_keys=True,
+        ).ask()
+    except (EOFError, KeyboardInterrupt):
+        return "debate"
+    return choice or "debate"
 
 
 def _interactive_memory():
@@ -1278,16 +1953,25 @@ def _interactive_cleanup():
     if include_discussed is None:
         return
 
+    include_tagged = questionary.confirm(
+        "也清理已打标签的旧文章？",
+        default=False,
+        style=custom_style,
+    ).ask()
+    if include_tagged is None:
+        return
+
     result = cleanup_old_articles(
         retention_days=days,
         dry_run=dry_run,
         keep_discussed=not include_discussed,
+        keep_tagged=not include_tagged,
     )
 
     count = result["candidate_count"] if dry_run else result["deleted_count"]
     print(f"\n{BOLD}{CYAN}[Article Cleanup]{RESET}")
     print(f"  {'可清理' if dry_run else '已清理'}: {count} 篇")
-    print(f"  {DIM}收藏文章会始终保留。{RESET}\n")
+    print(f"  {DIM}收藏文章会始终保留；带标签文章默认也会保留。{RESET}\n")
 
     for item in result.get("candidates", [])[:10]:
         print(f"  - ID:{item['id']} {item['title'][:60]}")
@@ -1448,6 +2132,18 @@ def main():
     list_parser.add_argument(
         "--limit", type=int, default=20, help="Max articles to show (default: 20)"
     )
+    list_parser.add_argument(
+        "--query", type=str, help="Search title, summary, note, and tags"
+    )
+    list_parser.add_argument(
+        "--tag", action="append", help="Filter by tag (repeatable)"
+    )
+    list_parser.add_argument(
+        "--source", type=str, help="Filter by source keyword"
+    )
+    list_parser.add_argument(
+        "--days", type=int, help="Only show articles from the last N days"
+    )
     list_parser.set_defaults(func=cmd_list)
 
     # favorite
@@ -1457,6 +2153,9 @@ def main():
     )
     favorite_parser.add_argument(
         "--note", type=str, help="Optional note for why this article is worth keeping"
+    )
+    favorite_parser.add_argument(
+        "--tags", type=str, help="Optional comma-separated tags to append"
     )
     favorite_parser.set_defaults(func=cmd_favorite)
 
@@ -1472,7 +2171,41 @@ def main():
     favorites_parser.add_argument(
         "--limit", type=int, default=20, help="Max articles to show (default: 20)"
     )
+    favorites_parser.add_argument(
+        "--query", type=str, help="Search title, summary, note, and tags"
+    )
+    favorites_parser.add_argument(
+        "--tag", action="append", help="Filter favorites by tag (repeatable)"
+    )
+    favorites_parser.add_argument(
+        "--source", type=str, help="Filter favorites by source keyword"
+    )
+    favorites_parser.add_argument(
+        "--days", type=int, help="Only show favorites from the last N days"
+    )
     favorites_parser.set_defaults(func=cmd_favorites)
+
+    # note
+    note_parser = subparsers.add_parser("note", help="Edit an article note")
+    note_parser.add_argument(
+        "--item", type=int, required=True, help="Article ID (use 'list' to see IDs)"
+    )
+    note_group = note_parser.add_mutually_exclusive_group(required=True)
+    note_group.add_argument("--text", type=str, help="Set or replace the note text")
+    note_group.add_argument("--clear", action="store_true", help="Clear the note")
+    note_parser.set_defaults(func=cmd_note)
+
+    # tag
+    tag_parser = subparsers.add_parser("tag", help="Edit article tags")
+    tag_parser.add_argument(
+        "--item", type=int, required=True, help="Article ID (use 'list' to see IDs)"
+    )
+    tag_group = tag_parser.add_mutually_exclusive_group(required=True)
+    tag_group.add_argument("--set", type=str, help="Replace tags with a comma-separated list")
+    tag_group.add_argument("--add", type=str, help="Add comma-separated tags")
+    tag_group.add_argument("--remove", type=str, help="Remove comma-separated tags")
+    tag_group.add_argument("--clear", action="store_true", help="Remove all tags")
+    tag_parser.set_defaults(func=cmd_tag)
 
     # cleanup
     cleanup_parser = subparsers.add_parser("cleanup", help="Clean old non-favorite articles")
@@ -1489,6 +2222,11 @@ def main():
         "--include-discussed",
         action="store_true",
         help="Also delete old articles that have debates or memories",
+    )
+    cleanup_parser.add_argument(
+        "--include-tagged",
+        action="store_true",
+        help="Also delete old articles that have archive tags",
     )
     cleanup_parser.set_defaults(func=cmd_cleanup)
 
@@ -1510,6 +2248,12 @@ def main():
     council_parser = subparsers.add_parser("council", help="Run Council discussion on an article")
     council_parser.add_argument(
         "--item", type=int, required=True, help="Article ID (use 'list' to see IDs)"
+    )
+    council_parser.add_argument(
+        "--paradigm",
+        choices=("debate", "report"),
+        default="debate",
+        help="Discussion paradigm: debate (adversarial, default) or report (draft + review)",
     )
     council_parser.set_defaults(func=cmd_council)
 
