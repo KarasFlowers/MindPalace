@@ -23,7 +23,7 @@ def _get_user_profile() -> str:
     if profile_path.exists():
         try:
             _user_profile_cache = profile_path.read_text(encoding="utf-8").strip()
-        except Exception as e:
+        except (OSError, UnicodeDecodeError) as e:
             logger.warning("Failed to read user_profile.md: %s", e)
             _user_profile_cache = ""
     else:

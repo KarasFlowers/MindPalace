@@ -61,6 +61,15 @@ ROUTING  ──►  OPENING  ──►  REBUTTAL loop (≤ N 轮)  ──►  JU
 
 **认知轨迹 (Trajectory)**：按月聚合你发言的 Embedding 质心，计算相邻月份的**思维漂移分数 (Drift Score)**，识别你的核心关注点和认知模式的演化趋势。
 
+### 🧭 心智漫游 (Inquiry)
+
+内部世界输入系统。通过预设的高质量问题卡，帮助用户从文章之外继续探索自己的价值排序、情绪模式和哲学直觉。
+
+- **认识自己**：童年记忆、真实自我、压力、遗憾、关系边界等自我回顾问题。
+- **哲思问题**：幸福、意义、痛苦、善恶、真理等价值判断问题，先让用户表达，再由 Agent 提炼隐藏前提。
+- **思想实验**：体验机器、电车难题、忒修斯之船、中文房间等问题卡，包含设定、追问和条件变体。
+- **长期沉淀**：回答可保存到 Memory，并用 `source_type/source_id` 区分来源，后续可回看“文章讨论之外的自己”。
+
 ### 🔍 Self-RAG (检索增强生成)
 
 Critic 和 Synthesizer 在辩论中可**主动触发 `web_search` 和 `fact_check` 工具**（基于 OpenAI function calling），对不确定的事实论断进行网络核查，并在输出中附上 `citations` 来源。工具调用设有**轮次上限 + 强制落地**机制（借鉴 Council 的 akashic 式防抖），杜绝工具无限循环。
@@ -161,7 +170,7 @@ SCOUT_FEED_PRESET=humanities
 # 或直接指定自定义 RSS 列表（会覆盖 preset）
 # SCOUT_FEEDS=https://aeon.co/feed.rss https://psyche.co/feed.rss
 
-# 文章库维护：自动清理 30 天前的普通文章，收藏/讨论/记忆过的文章默认保留
+# 文章库维护：自动清理 30 天前的普通文章，收藏/打标签/讨论/记忆过的文章默认保留
 ARTICLE_AUTO_CLEANUP=true
 ARTICLE_RETENTION_DAYS=30
 
@@ -207,16 +216,23 @@ python -m src scout --preset tech
 
 # 查看已保存的文章列表
 python -m src list
+python -m src list --query 现代性
+python -m src list --tag history --source aeon --days 30
 
-# 收藏高价值文章，并查看收藏夹
+# 收藏、标记高价值文章，并沉淀到个人档案库
 python -m src favorite --item 1
-python -m src favorite --item 1 --note "适合反复讨论现代性问题"
+python -m src favorite --item 1 --note "适合反复讨论现代性问题" --tags "history,modernity"
+python -m src note --item 1 --text "这篇适合和韦伯、阿伦特一起对读"
+python -m src tag --item 1 --add "ethics"
 python -m src favorites
+python -m src favorites --tag history
+python -m src favorites --query 现代性
 python -m src unfavorite --item 1
 
 # 清理旧文章：先预览，再执行
 python -m src cleanup --dry-run
 python -m src cleanup --days 30
+python -m src cleanup --dry-run --include-tagged
 
 # 查看文章完整内容
 python -m src view --item 1
@@ -226,6 +242,7 @@ python -m src brief --item 1
 
 # 对某篇文章发起议事厅讨论
 python -m src council --item 1
+# 讨论默认先给一屏摘要，再按需展开视角
 
 # 查看你的认知进化历史
 python -m src reflect
@@ -234,7 +251,7 @@ python -m src reflect
 python -m src daily
 
 # 进入交互式对话空间
-python -m src resolve              # 与整个议事厅对话
+python -m src resolve              # 与整个议事厅对话（默认先给综合回应）
 python -m src resolve --role mentor # 与特定角色对话
 python -m src resolve --list       # 查看历史会话并恢复
 python -m src resolve --session <id> # 恢复特定会话
@@ -317,8 +334,10 @@ python -m src
 2. 📚 **Browse** - 浏览文章
    - 从列表选择文章
    - 生成导读/查看完整内容/发起讨论
-3. 🧠 **Memory** - 查看认知历史
-4. 💬 **Resolve** - 交互式对话
+   - 给文章加标签、写备注、回看最近讨论
+3. ⭐ **Archive** - 在档案库里按关键词/标签/来源筛选高价值文章
+4. 🧠 **Memory** - 查看认知历史
+5. 💬 **Resolve** - 交互式对话
 
 ### 方式2：命令行模式（适合脚本化）
 

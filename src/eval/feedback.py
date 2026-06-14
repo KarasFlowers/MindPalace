@@ -62,8 +62,8 @@ def get_feedback_stats(days: int = 7) -> dict:
 
 def collect_feedback_interactive(debate_id: int) -> str | None:
     """交互式收集用户反馈。返回 rating 或 None（用户跳过）。"""
-    print("\n本次 Council 讨论如何？")
-    print("  [1] 👍 有启发  [2] 👎 无意义  [3] 📌 采纳某观点  [Enter] 跳过")
+    print("\n这轮讨论对你有帮助吗？")
+    print("  [1] 👍 有启发  [2] 👎 还不够好  [3] 📌 我采纳了一个视角  [Enter] 跳过")
 
     try:
         choice = input("> ").strip()
@@ -80,14 +80,14 @@ def collect_feedback_interactive(debate_id: int) -> str | None:
     note = None
 
     if rating == "adopted":
-        print("  采纳了哪个角色的观点？(critic/synthesizer/mentor)")
+        print("  你采纳了哪个角色的视角？(critic/synthesizer/mentor)")
         try:
             adopted_role = input("  > ").strip() or None
         except (EOFError, KeyboardInterrupt):
             pass
 
     try:
-        note_input = input("  备注（可选，直接 Enter 跳过）: ").strip()
+        note_input = input("  想补一句吗？也可以顺手告诉我下次更想要哪种风格: ").strip()
         if note_input:
             note = note_input
     except (EOFError, KeyboardInterrupt):

@@ -46,7 +46,7 @@ def run_daily_session():
     _session_span = span("daily.session")
     _session_span.__enter__()
     try:
-            print(f"\n{BOLD}{MAGENTA}")
+        print(f"\n{BOLD}{MAGENTA}")
         print("  __  __ _           _ _____      _                 ")
         print(" |  \\/  (_)         | |  __ \\    | |                ")
         print(" | \\  / |_ _ __   __| | |__) |_ _| | __ _  ___ ___  ")
@@ -58,7 +58,7 @@ def run_daily_session():
         time.sleep(1)
 
         print(f"  {BOLD}{CYAN}[1/3] SCOUTING{RESET} {DIM}Scouring the web for high-density signals...{RESET}")
-    
+
         # 1. Scout 阶段
         scout_cfg = get_scout_config()
         scout_results = run_scout(top_k=5, provider_config=scout_cfg)
@@ -68,7 +68,7 @@ def run_daily_session():
 
         top_article = scout_results[0]
         article_id = _get_article_id_by_url(top_article.url)
-    
+
         print(f"  {GREEN}✓ Found top signal: {BOLD}{top_article.title}{RESET}")
         print(f"  {DIM}  Score: {top_article.total_score}/10 | SRC: {top_article.source}{RESET}\n")
 
@@ -81,17 +81,17 @@ def run_daily_session():
 
         sys.stdout.write(f"  {DIM}The Critic is analyzing flaws...{RESET}\r")
         sys.stdout.flush()
-    
+
         # 运行包含请求过程
         council_cfg = get_council_config()
         result = run_council(
             title=top_article.title,
             summary=top_article.summary,
-            content=top_article.summary, # 使用摘要作为正文，提高速度
+            content=top_article.summary,  # 使用摘要作为正文，提高速度
             provider_config=council_cfg,
         )
 
-        sys.stdout.write(" " * 50 + "\r") # clear line
+        sys.stdout.write(" " * 50 + "\r")  # clear line
         print(format_council_result(result, colors=COLORS))
         logging.getLogger("src.council.flow").setLevel(logging.INFO)
 
@@ -148,27 +148,30 @@ def run_daily_session():
         # 回声定位
         print(f"  {DIM}Running Echo Location against historical patterns...{RESET}")
         logging.getLogger("src.memory.echo").setLevel(logging.WARNING)
-    
+
         current_tags = {
             "core_preference": profile.core_preference,
             "reasoning_style": profile.reasoning_style,
             "emotional_tone": profile.emotional_tone,
             "stance_summary": profile.stance_summary,
         }
-    
+
         related = find_related_memories(user_response, exclude_id=memory_id)
         echo = generate_echo_report(user_response, current_tags, related, provider_config=memory_cfg)
-    
+
         logging.getLogger("src.memory.echo").setLevel(logging.INFO)
 
         print(format_echo_report(echo, colors=COLORS))
-    
+
         # 认知固化检查
         try:
-            from src.memory.crystallize import crystallize_if_needed
+            from src.memory.crystallize import crystallize_if_needed, render_crystal_terminal
+
             crystal = crystallize_if_needed(provider_config=memory_cfg)
             if crystal:
-                print(f"  {DIM}\u2728 Cognitive profile crystallized.{RESET}")
+                print(f"\n  {BOLD}{MAGENTA}\u2728 认知洞察已结晶{RESET}")
+                print("  " + render_crystal_terminal(crystal, colors=COLORS).replace("\n", "\n  "))
+                print()
         except Exception:
             logger.exception("Crystallize failed")
 
@@ -176,6 +179,7 @@ def run_daily_session():
         if debate_id:
             try:
                 from src.eval.feedback import collect_feedback_interactive
+
                 collect_feedback_interactive(debate_id)
             except Exception:
                 logger.debug("Feedback collection skipped")

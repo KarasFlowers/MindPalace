@@ -27,12 +27,14 @@ mindpalace/
 │   │
 │   ├── council/                    # 多智能体辩论系统
 │   │   ├── __init__.py
-│   │   ├── flow.py                 # 状态机主循环
+│   │   ├── flow.py                 # 状态机主循环（范式调度入口）
 │   │   ├── state.py                # DebateState / Turn / Phase 数据模型
 │   │   ├── router.py               # 难度路由（动态派单）
 │   │   ├── judge.py                # Judge 角色（midcheck + finalize）
 │   │   ├── rebuttal.py             # Prompt 构造（opening / rebuttal）
 │   │   ├── roles.py                # 角色定义 + 工具权限
+│   │   ├── paradigms.py            # 讨论范式（Debate / Report）— 借鉴 MALLM
+│   │   ├── registry.py             # 范式注册表（字符串 → 类映射）
 │   │   └── output.py               # 结果格式化
 │   │
 │   ├── eval/                       # 评估闭环
@@ -47,11 +49,12 @@ mindpalace/
 │   │
 │   ├── memory/                     # 认知记忆系统
 │   │   ├── __init__.py
-│   │   ├── store.py                # 记忆存储（向量召回 + 关键词回退）
-│   │   ├── embedder.py             # Embedding 抽象 + OpenAI 实现
+│   │   ├── store.py                # 记忆存储（A-MEM 增强嵌入 + 向量召回 + 关键词回退）
+│   │   ├── embedder.py             # Embedding 抽象 + OpenAI 实现 + 增强文本构建
 │   │   ├── profiler.py             # 认知画像分析
 │   │   ├── echo.py                 # 回声定位（历史对比）
-│   │   ├── crystallize.py          # 认知固化（压缩结晶）
+│   │   ├── crystallize.py          # 结构化认知结晶（Axiomind 知识金字塔）
+│   │   ├── brain_export.py         # 认知档案 Markdown 导出（brain/ 目录）
 │   │   └── trajectory.py           # 月度质心漂移分析
 │   │
 │   ├── obs/                        # 可观测性（LLMOps）
@@ -76,6 +79,14 @@ mindpalace/
 │   │   ├── base.py                 # Tool Protocol + 注册表
 │   │   ├── web_search.py           # DuckDuckGo 搜索
 │   │   └── fact_check.py           # 事实核查
+│
+│   ├── inquiry/                    # 心智漫游（内省式问题卡）
+│   │   ├── __init__.py
+│   │   ├── types.py                # PromptCard 数据模型
+│   │   ├── library.py              # 卡组加载（data/inquiry/*.json）
+│   │   ├── analysis.py             # 回答分析（LLM 提炼）
+│   │   ├── session.py              # 单次会话流程
+│   │   └── cli.py                  # 交互式子菜单
 │   │
 │   └── workflows/                  # 端到端流程
 │       ├── __init__.py
@@ -126,16 +137,27 @@ mindpalace/
 | 文件 | 功能 | 关键类/函数 |
 |------|------|------------|
 | `state.py` | 数据模型 | `DebateState`, `Turn`, `Phase` |
-| `flow.py` | 状态机主循环 | `run_council()` |
+| `flow.py` | 状态机主循环（范式调度） | `run_council()` |
 | `router.py` | 难度路由 | `route()` |
 | `judge.py` | Judge 角色 | `midcheck()`, `finalize()` |
 | `rebuttal.py` | Prompt 构造 | `build_opening_prompt()`, `build_rebuttal_prompt()` |
 | `roles.py` | 角色定义 | `get_role()`, `TOOL_ENABLED_ROLES` |
+| `paradigms.py` | 讨论范式 | `DiscussionParadigm`, `DebateParadigm`, `ReportParadigm` |
+| `registry.py` | 范式注册表 | `PARADIGMS`, `register_paradigm()`, `get_paradigm()` |
 | `output.py` | 结果格式化 | `format_council_result()` |
 
-**核心流程**：
+**核心流程**（默认 Debate 范式）：
 ```
 ROUTING → OPENING → REBUTTAL(循环) → JUDGING → DONE
+```
+
+**讨论范式**（借鉴 MALLM，通过注册表可插拔）：
+- `debate`（默认）：对抗式多轮反驳，midcheck 收敛
+- `report`：中心化起草（主起草人生成报告）+ 其他人单轮审阅
+
+```bash
+python -m src council --item 1                      # 默认 debate 范式
+python -m src council --item 1 --paradigm report    # Report 范式
 ```
 
 ---
@@ -146,12 +168,29 @@ ROUTING → OPENING → REBUTTAL(循环) → JUDGING → DONE
 
 | 文件 | 功能 | 关键类/函数 |
 |------|------|------------|
-| `store.py` | 记忆存储 | `save_memory()`, `find_related_memories()` |
-| `embedder.py` | 向量化 | `Embedder`, `OpenAIEmbedder`, `cosine_similarity()` |
+| `store.py` | 记忆存储（A-MEM 增强嵌入） | `save_memory()`, `find_related_memories()`, `rebuild_embeddings()` |
+| `embedder.py` | 向量化 + 增强文本构建 | `Embedder`, `OpenAIEmbedder`, `build_enhanced_text()`, `cosine_similarity()` |
 | `profiler.py` | 认知画像 | `profile_response()`, `CognitiveProfile` |
 | `echo.py` | 回声定位 | `generate_echo_report()`, `EchoReport` |
-| `crystallize.py` | 认知固化 | `crystallize_if_needed()` |
+| `crystallize.py` | 结构化认知结晶（Axiomind 知识金字塔） | `crystallize_if_needed()` |
+| `brain_export.py` | 认知档案 Markdown 导出 | `export_brain()` |
 | `trajectory.py` | 轨迹分析 | `compute_trajectory()` |
+
+**A-MEM 增强嵌入**：存储与查询都嵌入拼接后的 `content + stance + keywords + preferences`，
+而非原始内容，显著提升召回质量。`rebuild_embeddings()` 可迁移存量记录。
+
+**Axiomind 知识金字塔**（结构化结晶输出）：
+```
+Layer 1: 原始记忆 (memories 表)
+Layer 2: 结构化洞察 (profile_crystals 表 + user_profile.md)
+         ├─ observation  日常观察模式（candidate 状态）
+         ├─ principle    可复用行动规则（candidate 状态）
+         └─ axiom        身份级深层信念（candidate 状态，需人类激活）
+Layer 3: 认知轨迹 (月度质心漂移)
+```
+
+`export_brain()` 将结构化洞察导出为 `data/brain/{axioms,principles,observations}/*.md`，
+带 YAML frontmatter，可被 Obsidian 或未来 agent 直接读取。
 
 **三层架构**：
 ```
@@ -293,6 +332,30 @@ Scout 抓取 → 选择文章 → Council 辩论 → 用户回应 →
 - 无限轮次对话
 - 自动历史压缩（>40 条消息）
 - 会话持久化
+
+---
+
+### 11. Inquiry（心智漫游）
+
+**职责**：内省式问题卡驱动自我反思，回答写入长期记忆
+
+| 文件 | 功能 | 关键类/函数 |
+|------|------|------------|
+| `types.py` | 卡片数据模型 | `PromptCard`, `PromptCard.from_dict()` |
+| `library.py` | 卡组加载 | `load_cards()`, `get_card()`, `choose_random_card()` |
+| `analysis.py` | 回答分析 | `analyze_response()` |
+| `session.py` | 单次会话流程 | `run_inquiry_session()`, `save_inquiry_memory()` |
+| `cli.py` | 交互式子菜单 | `run_inquiry_menu()` |
+
+**卡组**（`data/inquiry/*.json`，源文本归档于 `data/inquiry/sources/`）：
+- `self.json` — 认识自己（36 张卡）
+- `philosophy.json` — 哲思问题（12 张卡）
+- `thought_experiments.json` — 思想实验（7 张卡，含 context/followups/twists）
+
+**流程**：
+```
+选卡 → 展示问题 → 用户多行回答 → LLM 提炼心智镜像 → 写入 memories 表（带 source_type/source_id）
+```
 
 ---
 
