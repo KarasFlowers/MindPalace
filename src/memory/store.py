@@ -72,10 +72,17 @@ def save_memory(
     profile: CognitiveProfile,
     source_type: str = "article",
     source_id: str | None = None,
+    link_after_save: bool = False,
+    provider_config: dict | None = None,
 ) -> int:
     """保存一条用户记忆（观点 + 认知画像 + embedding）。返回新记录的 ID。
 
     如果 embedding 计算失败（API 不可用等），记忆仍会写入但 embedding 为 NULL。
+
+    Args:
+        link_after_save: 若 True，保存后异步触发 A-MEM 演化（link_memories），
+            为新记忆与历史记忆建立链接。默认 False 以保持零延迟。
+        provider_config: 演化用的 provider 配置（仅 link_after_save=True 时使用）。
     """
     init_memories_table()
     now = datetime.now(timezone.utc).isoformat()
@@ -116,6 +123,14 @@ def save_memory(
         "Saved memory #%d for article '%s' (embedded=%s)",
         new_id, article_title[:40], embed_blob is not None,
     )
+
+    if link_after_save:
+        try:
+            from src.memory.evolution import link_memories
+            link_memories(new_id, provider_config=provider_config)
+        except Exception as exc:
+            logger.warning("link_after_save failed for memory #%d: %s", new_id, exc)
+
     return new_id
 
 
@@ -162,12 +177,20 @@ def find_related_memories(
     exclude_id: int | None = None,
     limit: int = 5,
     min_similarity: float = 0.35,
+    agentic: bool = False,
+    track_retrieval: bool = False,
 ) -> list[dict]:
     """向量召回 + 关键词回退，查找与 query_text 语义相关的历史记忆。
 
     1. 对 query_text 做 embedding，与所有有 embedding 的记忆算余弦相似度。
     2. 若向量召回结果为 0（例如旧记录无 embedding 或 API 不可用），
        则回退到 topic_keywords LIKE 匹配。
+
+    Args:
+        agentic: 若 True，启用 A-MEM agentic 检索——向量召回后沿 top 结果的
+            ``links`` 追加邻居记忆（去重），扩展召回面。
+        track_retrieval: 若 True，递增命中记忆的 retrieval_count（A-MEM 访问统计）。
+            默认 False 以保持现有行为（避免回声报告等只读场景污染统计）。
     """
     init_memories_table()
 
@@ -177,13 +200,69 @@ def find_related_memories(
     # --- 1. 向量召回 ---
     results = _vector_search(query_text, exclude_id, limit, min_similarity)
     if results:
-        logger.info("Found %d related memories via vector search", len(results))
+        if agentic:
+            results = _expand_via_links(results, exclude_id, limit)
+        logger.info("Found %d related memories via vector search%s",
+                    len(results), " (agentic)" if agentic else "")
+        if track_retrieval:
+            _increment_retrieval_count([r.get("id") for r in results])
         return results
 
     # --- 2. 关键词回退 ---
     results = _keyword_fallback(query_text, exclude_id, limit)
     logger.info("Found %d related memories via keyword fallback", len(results))
+    if track_retrieval and results:
+        _increment_retrieval_count([r.get("id") for r in results])
     return results
+
+
+def _expand_via_links(
+    seed_results: list[dict],
+    exclude_id: int | None,
+    limit: int,
+) -> list[dict]:
+    """A-MEM agentic 检索：沿 seed 结果的 links 追加邻居，去重后返回。
+
+    邻居的 similarity 沿用 seed 的相似度（作为代理，因未重新嵌入查询）。
+    """
+    if not seed_results:
+        return seed_results
+
+    seen_ids = {r.get("id") for r in seed_results if r.get("id") is not None}
+    if exclude_id is not None:
+        seen_ids.add(exclude_id)
+
+    expanded = list(seed_results)
+    for seed in seed_results:
+        links = seed.get("links") or {}
+        if not isinstance(links, dict) or not links:
+            continue
+        # links 的 key 是邻居 id（字符串），value 是权重
+        for neighbor_id_str, weight in links.items():
+            try:
+                neighbor_id = int(neighbor_id_str)
+            except (TypeError, ValueError):
+                continue
+            if neighbor_id in seen_ids:
+                continue
+            neighbor = get_memory(neighbor_id)
+            if neighbor is None:
+                continue
+            seen_ids.add(neighbor_id)
+            # 用 seed 的相似度 × 链接权重 作为代理相似度
+            neighbor["similarity"] = round(
+                float(seed.get("similarity", 0.5)) * float(weight or 0.5), 4
+            )
+            neighbor["_via_link"] = seed.get("id")
+            expanded.append(neighbor)
+            if len(expanded) >= limit * 2:  # 扩展上限，避免无限膨胀
+                break
+        if len(expanded) >= limit * 2:
+            break
+
+    # 按 similarity 降序，截断到 limit
+    expanded.sort(key=lambda r: -r.get("similarity", 0.0))
+    return expanded[:limit]
 
 
 def _vector_search(

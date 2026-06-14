@@ -99,6 +99,8 @@ def save_inquiry_memory(card: PromptCard, user_response: str, provider_config: d
         profile=profile,
         source_type=card.kind,
         source_id=card.id,
+        link_after_save=True,
+        provider_config=cfg,
     )
     try:
         related = find_related_memories(user_response, exclude_id=memory_id)
