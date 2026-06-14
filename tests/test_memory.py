@@ -64,15 +64,25 @@ class TestProfiler:
 
 
 def _make_fake_embedder(dim: int = 8):
-    """返回一个确定性的假 embedder，用于测试。"""
+    """返回一个确定性的假 embedder，用于测试。
+
+    采用 token 叠加：相似文本（共享 token）向量方向接近，更贴近真实 embedding 模型，
+    也能验证 A-MEM 增强嵌入对召回质量的提升。
+    """
+    import re as _re
     class FakeEmbedder:
         model_name = "fake-embed"
         def embed(self, texts):
             vecs = []
             for t in texts:
-                rng = np.random.RandomState(hash(t) % 2**31)
-                v = rng.randn(dim).astype(np.float32)
-                v /= np.linalg.norm(v)
+                v = np.zeros(dim, dtype=np.float32)
+                tokens = _re.findall(r"[\u4e00-\u9fff]|[a-zA-Z]+", t.lower())
+                for tok in tokens:
+                    rng = np.random.RandomState(hash(tok) % 2**31)
+                    v += rng.randn(dim).astype(np.float32)
+                norm = np.linalg.norm(v)
+                if norm > 0:
+                    v /= norm
                 vecs.append(v)
             return vecs
     return FakeEmbedder()
@@ -85,7 +95,7 @@ class TestStore:
         self._tmp.close()
         self._fake_embedder = _make_fake_embedder()
         self._patchers = [
-            patch("src.memory.store.DB_PATH", self._tmp.name),
+            patch("src.storage.db.DB_PATH", self._tmp.name),
             patch("src.memory.embedder.get_embedder", return_value=self._fake_embedder),
         ]
         for p in self._patchers:
@@ -174,6 +184,8 @@ class TestStore:
         assert len(all_mems) == 2
         # embedding blob should not be exposed
         assert "embedding" not in all_mems[0]
+        assert all_mems[0]["source_type"] == "article"
+        assert all_mems[0]["source_id"] is None
 
 
 # === Echo Location 测试 ===

@@ -11,8 +11,8 @@ from datetime import datetime, timezone
 import numpy as np
 import sqlite3
 
-from src.config import DB_PATH
 from src.memory.profiler import CognitiveProfile
+from src.storage.db import _get_conn
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS memories (
     emotional_tone  TEXT,
     embedding       BLOB,
     embed_model     TEXT,
+    source_type     TEXT NOT NULL DEFAULT 'article',
+    source_id       TEXT,
+    links           TEXT,                          -- JSON: {"neighbor_id": weight, ...}（A-MEM 演化链接）
+    retrieval_count INTEGER NOT NULL DEFAULT 0,    -- 被召回次数（A-MEM 访问统计）
     created_at      TEXT NOT NULL
 );
 """
@@ -36,13 +40,13 @@ CREATE TABLE IF NOT EXISTS memories (
 _MIGRATION_COLUMNS = [
     ("embedding", "BLOB"),
     ("embed_model", "TEXT"),
+    ("source_type", "TEXT NOT NULL DEFAULT 'article'"),
+    ("source_id", "TEXT"),
+    # A-MEM 演化升级新增：
+    ("links", "TEXT"),
+    ("retrieval_count", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
-
-def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def init_memories_table():
@@ -66,6 +70,8 @@ def save_memory(
     article_title: str,
     user_response: str,
     profile: CognitiveProfile,
+    source_type: str = "article",
+    source_id: str | None = None,
 ) -> int:
     """保存一条用户记忆（观点 + 认知画像 + embedding）。返回新记录的 ID。
 
@@ -74,7 +80,10 @@ def save_memory(
     init_memories_table()
     now = datetime.now(timezone.utc).isoformat()
 
-    embed_blob, embed_model = _safe_embed(user_response)
+    embed_blob, embed_model = _safe_embed(
+        user_response,
+        profile=profile,
+    )
 
     with _get_conn() as conn:
         cursor = conn.execute(
@@ -82,8 +91,8 @@ def save_memory(
             INSERT INTO memories
             (article_id, article_title, user_response, stance_summary,
              topic_keywords, core_preference, reasoning_style, emotional_tone,
-             embedding, embed_model, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             embedding, embed_model, source_type, source_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 article_id,
@@ -96,6 +105,8 @@ def save_memory(
                 profile.emotional_tone,
                 embed_blob,
                 embed_model,
+                source_type,
+                source_id,
                 now,
             ),
         )
@@ -108,12 +119,38 @@ def save_memory(
     return new_id
 
 
-def _safe_embed(text: str) -> tuple[bytes | None, str | None]:
-    """尝试计算 embedding，失败时返回 (None, None) 不阻塞存储。"""
+def _safe_embed(
+    text: str,
+    profile: "CognitiveProfile | None" = None,
+    stance_summary: str = "",
+    topic_keywords: list[str] | None = None,
+    core_preference: list[str] | None = None,
+) -> tuple[bytes | None, str | None]:
+    """尝试计算 embedding，失败时返回 (None, None) 不阻塞存储。
+
+    采用 A-MEM 式元数据增强：嵌入拼接后的 `content + stance + keywords + preferences`
+    而非原始文本。若提供 profile 则从中提取元数据，否则使用显式参数（查询端用）。
+    """
+    from src.memory.embedder import build_enhanced_text, get_embedder, vec_to_blob
+
+    if profile is not None:
+        enhanced = build_enhanced_text(
+            content=text,
+            stance_summary=profile.stance_summary or stance_summary,
+            topic_keywords=profile.topic_keywords or topic_keywords or [],
+            core_preference=profile.core_preference or core_preference or [],
+        )
+    else:
+        enhanced = build_enhanced_text(
+            content=text,
+            stance_summary=stance_summary,
+            topic_keywords=topic_keywords or [],
+            core_preference=core_preference or [],
+        )
+
     try:
-        from src.memory.embedder import get_embedder, vec_to_blob
         embedder = get_embedder()
-        vecs = embedder.embed([text])
+        vecs = embedder.embed([enhanced])
         return vec_to_blob(vecs[0]), embedder.model_name
     except Exception as exc:
         logger.warning("Embedding failed (will store without vector): %s", exc)
@@ -155,11 +192,16 @@ def _vector_search(
     limit: int,
     min_similarity: float,
 ) -> list[dict]:
-    """用 embedding 余弦相似度召回。"""
+    """用 embedding 余弦相似度召回。
+
+    查询端同样用增强文本格式嵌入（元数据字段留空），保证与存储端格式一致，
+    使余弦相似度可比。
+    """
     try:
-        from src.memory.embedder import get_embedder, blob_to_vec, cosine_similarity
+        from src.memory.embedder import build_enhanced_text, get_embedder, blob_to_vec, cosine_similarity
         embedder = get_embedder()
-        query_vec = embedder.embed([query_text])[0]
+        enhanced_query = build_enhanced_text(content=query_text)
+        query_vec = embedder.embed([enhanced_query])[0]
     except Exception as exc:
         logger.warning("Embedding query failed, skipping vector search: %s", exc)
         return []
@@ -245,8 +287,69 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
     d = dict(row)
     d["topic_keywords"] = json.loads(d.get("topic_keywords") or "[]")
     d["core_preference"] = json.loads(d.get("core_preference") or "[]")
+    d["links"] = json.loads(d.get("links") or "{}")
+    if d.get("retrieval_count") is None:
+        d["retrieval_count"] = 0
     d.pop("embedding", None)  # 不在 API 层暴露原始 blob
     return d
+
+
+def _increment_retrieval_count(memory_ids: list[int]) -> None:
+    """批量递增被召回记忆的 retrieval_count（A-MEM 访问统计）。"""
+    if not memory_ids:
+        return
+    init_memories_table()
+    ids = [int(mid) for mid in memory_ids if mid is not None]
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    with _get_conn() as conn:
+        conn.execute(
+            f"UPDATE memories SET retrieval_count = retrieval_count + 1 "
+            f"WHERE id IN ({placeholders})",
+            ids,
+        )
+
+
+def get_memory(memory_id: int) -> dict | None:
+    """按 id 获取单条记忆（含 links/retrieval_count）。"""
+    init_memories_table()
+    with _get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+    return _row_to_dict(row) if row else None
+
+
+def update_memory_links(memory_id: int, links: dict) -> None:
+    """更新指定记忆的 links 字段（A-MEM strengthen 用）。"""
+    init_memories_table()
+    with _get_conn() as conn:
+        conn.execute(
+            "UPDATE memories SET links = ? WHERE id = ?",
+            (json.dumps(links, ensure_ascii=False), memory_id),
+        )
+
+
+def update_memory_tags(memory_id: int, topic_keywords: list[str] | None = None,
+                       stance_summary: str | None = None) -> None:
+    """轻量演化：更新邻居记忆的 topic_keywords / stance_summary（A-MEM update_neighbor 用）。"""
+    init_memories_table()
+    sets: list[str] = []
+    params: list = []
+    if topic_keywords is not None:
+        sets.append("topic_keywords = ?")
+        params.append(json.dumps(topic_keywords, ensure_ascii=False))
+    if stance_summary is not None:
+        sets.append("stance_summary = ?")
+        params.append(stance_summary)
+    if not sets:
+        return
+    params.append(memory_id)
+    with _get_conn() as conn:
+        conn.execute(
+            f"UPDATE memories SET {', '.join(sets)} WHERE id = ?", params
+        )
 
 
 def get_all_memories(limit: int = 50) -> list[dict]:
@@ -257,6 +360,42 @@ def get_all_memories(limit: int = 50) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM memories ORDER BY created_at DESC LIMIT ?", (limit,)
         ).fetchall()
+
+    return [_row_to_dict(row) for row in rows]
+
+
+def get_memories_by_source(
+    source_types: str | list[str] | tuple[str, ...] | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    """按来源类型获取记忆；未传 source_types 时返回非 article 来源。"""
+    init_memories_table()
+
+    with _get_conn() as conn:
+        if source_types is None:
+            rows = conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE source_type != 'article'
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        else:
+            types = [source_types] if isinstance(source_types, str) else list(source_types)
+            if not types:
+                return []
+            placeholders = ",".join("?" for _ in types)
+            rows = conn.execute(
+                f"""
+                SELECT * FROM memories
+                WHERE source_type IN ({placeholders})
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                [*types, limit],
+            ).fetchall()
 
     return [_row_to_dict(row) for row in rows]
 
@@ -287,3 +426,53 @@ def get_recent_memories(limit: int = 10) -> list[dict]:
             "SELECT * FROM memories ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
     return [_row_to_dict(row) for row in reversed(rows)]
+
+
+def rebuild_embeddings(limit: int = 0) -> int:
+    """用 A-MEM 增强格式重新嵌入历史记忆（存量迁移）。
+
+    对 embedding 为 NULL 或需要用新格式重新计算的记录，基于其完整 profile
+    重新构建增强文本并嵌入。
+
+    Args:
+        limit: 最多迁移的记录数；0 表示全部。
+
+    Returns:
+        成功重新嵌入的记录数。
+    """
+    init_memories_table()
+
+    from src.memory.profiler import CognitiveProfile
+
+    sql = "SELECT * FROM memories WHERE embedding IS NULL ORDER BY id"
+    params: list = []
+    if limit and limit > 0:
+        sql += " LIMIT ?"
+        params.append(limit)
+
+    with _get_conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    updated = 0
+    for row in rows:
+        profile = CognitiveProfile(
+            core_preference=json.loads(row["core_preference"] or "[]"),
+            reasoning_style=row["reasoning_style"] or "",
+            emotional_tone=row["emotional_tone"] or "",
+            topic_keywords=json.loads(row["topic_keywords"] or "[]"),
+            stance_summary=row["stance_summary"] or "",
+        )
+        embed_blob, embed_model = _safe_embed(
+            row["user_response"], profile=profile
+        )
+        if embed_blob is None:
+            continue
+        with _get_conn() as conn:
+            conn.execute(
+                "UPDATE memories SET embedding = ?, embed_model = ? WHERE id = ?",
+                (embed_blob, embed_model, row["id"]),
+            )
+        updated += 1
+
+    logger.info("Rebuilt embeddings for %d memories", updated)
+    return updated
