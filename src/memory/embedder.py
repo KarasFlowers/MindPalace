@@ -110,3 +110,36 @@ def vec_to_blob(vec: np.ndarray) -> bytes:
 def blob_to_vec(blob: bytes) -> np.ndarray:
     """将 BLOB 反序列化为 numpy float32 向量。"""
     return np.frombuffer(blob, dtype=np.float32).copy()
+
+
+def build_enhanced_text(
+    content: str,
+    stance_summary: str = "",
+    topic_keywords: list[str] | None = None,
+    core_preference: list[str] | None = None,
+) -> str:
+    """构建 A-MEM 式的元数据增强嵌入文本。
+
+    嵌入拼接后的增强文本而非原始内容，使向量检索质量显著优于仅嵌入原始内容
+    （参考 A-MEM 的 enhanced_document 设计）。
+
+    所有元数据字段都是可选的：存储时传入完整画像，查询时仅传 content，
+    保证两侧格式一致（缺失字段留空），使余弦相似度可比。
+
+    Args:
+        content: 原始正文（user_response）。
+        stance_summary: 一句话立场概括（来自 CognitiveProfile）。
+        topic_keywords: 话题关键词列表。
+        core_preference: 核心偏好标签列表。
+
+    Returns:
+        拼接后的增强文本。
+    """
+    parts = [content.strip()]
+    if stance_summary:
+        parts.append(f"stance: {stance_summary.strip()}")
+    if topic_keywords:
+        parts.append("keywords: " + ", ".join(k.strip() for k in topic_keywords if k and k.strip()))
+    if core_preference:
+        parts.append("preferences: " + ", ".join(p.strip() for p in core_preference if p and p.strip()))
+    return "\n".join(parts)

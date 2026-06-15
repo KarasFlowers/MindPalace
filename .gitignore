@@ -13,6 +13,10 @@ venv/
 # Database
 *.db
 
+# Personal cognitive data (结晶洞察 / 认知档案，含个人数据)
+data/user_profile.md
+data/brain/
+
 # IDE
 .vscode/
 .idea/
@@ -36,3 +40,6 @@ introduction.md
 FUSION_PLAN.md
 重点方向参考.md
 项目简述.txt
+
+# External reference projects
+reference/

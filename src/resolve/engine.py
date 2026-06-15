@@ -23,6 +23,156 @@ RED = "\033[31m"
 MAGENTA = "\033[35m"
 RESET = "\033[0m"
 
+ROLE_COLORS = {
+    "critic": RED,
+    "synthesizer": GREEN,
+    "mentor": YELLOW,
+}
+
+
+def _truncate_text(text: str | None, limit: int = 100) -> str:
+    content = (text or "").strip().replace("\n", " ")
+    if len(content) <= limit:
+        return content
+    return content[: limit - 3].rstrip() + "..."
+
+
+def _strip_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    lines = stripped.splitlines()
+    if lines:
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def _parse_structured_response(text: str) -> dict | None:
+    """尽量把角色输出解析成 JSON，失败则返回 None。"""
+    candidate = _strip_code_fence(text)
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = candidate[start : end + 1]
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _extract_role_highlight(role_key: str, response: str) -> str:
+    parsed = _parse_structured_response(response)
+    if parsed:
+        if role_key == "critic":
+            vulnerabilities = parsed.get("vulnerabilities") or []
+            first = vulnerabilities[0] if vulnerabilities else {}
+            return (
+                first.get("assumption")
+                or first.get("counter")
+                or parsed.get("verdict")
+                or response
+            )
+        if role_key == "synthesizer":
+            connections = parsed.get("connections") or []
+            first = connections[0] if connections else {}
+            return (
+                first.get("insight")
+                or first.get("analogy")
+                or parsed.get("synthesis")
+                or response
+            )
+        if role_key == "mentor":
+            questions = parsed.get("questions") or []
+            first = questions[0] if questions else {}
+            return (
+                first.get("question")
+                or parsed.get("provocation")
+                or response
+            )
+
+    lines = [line.strip("- ").strip() for line in response.splitlines() if line.strip()]
+    return lines[0] if lines else response
+
+
+def _print_role_response(role_key: str, response: str):
+    """把角色输出尽量转换成可读结构，而不是直接把 JSON 扔给用户。"""
+    role = get_role(role_key)
+    color = ROLE_COLORS.get(role_key, CYAN)
+    parsed = _parse_structured_response(response)
+
+    print(f"\n{BOLD}{color}{role['name']}{RESET}")
+    if not parsed:
+        print(response)
+        return
+
+    if role_key == "critic":
+        vulnerabilities = parsed.get("vulnerabilities") or []
+        for item in vulnerabilities[:3]:
+            severity = str(item.get("severity", "?")).upper()
+            print(f"  - [{severity}] {item.get('assumption', '')}")
+            if item.get("counter"):
+                print(f"    {DIM}崩塌条件: {item['counter']}{RESET}")
+        if parsed.get("missing_counterexample"):
+            print(f"  {MAGENTA}反例: {parsed['missing_counterexample']}{RESET}")
+        if parsed.get("verdict"):
+            print(f"  {DIM}一句话判断: {parsed['verdict']}{RESET}")
+    elif role_key == "synthesizer":
+        connections = parsed.get("connections") or []
+        for item in connections[:3]:
+            print(f"  - [{item.get('domain', '?')}] {item.get('analogy', '')}")
+            if item.get("insight"):
+                print(f"    {DIM}启发: {item['insight']}{RESET}")
+        if parsed.get("synthesis"):
+            print(f"  {DIM}综合洞察: {parsed['synthesis']}{RESET}")
+    elif role_key == "mentor":
+        questions = parsed.get("questions") or []
+        for item in questions[:3]:
+            print(f"  - [{item.get('level', '追问')}] {item.get('question', '')}")
+        if parsed.get("provocation"):
+            print(f"  {MAGENTA}刺激点: {parsed['provocation']}{RESET}")
+    else:
+        print(response)
+
+
+def _print_council_digest(results: dict[str, str]):
+    """默认只展示一层综合摘要，减轻每轮三角色齐发的压迫感。"""
+    print(f"\n{BOLD}{CYAN}[Council Composite]{RESET}")
+    print(f"  {RED}批判者提醒你{RESET} {_truncate_text(_extract_role_highlight('critic', results.get('critic', '')), 110)}")
+    print(f"  {GREEN}连接者补了一层{RESET} {_truncate_text(_extract_role_highlight('synthesizer', results.get('synthesizer', '')), 110)}")
+    print(f"  {YELLOW}导师最想追问{RESET} {_truncate_text(_extract_role_highlight('mentor', results.get('mentor', '')), 110)}")
+    print(f"  {DIM}你可以继续反驳一个前提、讲一个例子，或让我展开某个角色。{RESET}")
+
+
+def _offer_role_expansion(results: dict[str, str]):
+    """按需展开角色，避免每一轮都输出三大段。"""
+    while True:
+        print(
+            f"{DIM}需要我展开哪个角色？"
+            f" [1] Critic [2] Synthesizer [3] Mentor [4] 全部原文 [Enter] 继续{RESET}"
+        )
+        try:
+            choice = input(f"{GREEN}>{RESET} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            return
+
+        if choice in ("", "c", "continue"):
+            return
+        if choice == "1":
+            _print_role_response("critic", results.get("critic", ""))
+        elif choice == "2":
+            _print_role_response("synthesizer", results.get("synthesizer", ""))
+        elif choice == "3":
+            _print_role_response("mentor", results.get("mentor", ""))
+        elif choice == "4":
+            for role_key in get_discussion_order():
+                _print_role_response(role_key, results.get(role_key, ""))
+        else:
+            print(f"{YELLOW}请输入 1/2/3/4，或直接回车继续。{RESET}")
+
 class ResolveSession:
     def __init__(self, session_id: str | None = None, title: str = "New Session", mode: str = "single"):
         self.session_id = session_id or str(uuid.uuid4())
@@ -169,17 +319,19 @@ def run_repl(role_key: str | None = None, session_id: str | None = None):
         try:
             role = get_role(role_key)
             print(f"  当前正在与: {role['name']} 对话")
-        except Exception as e:
+        except ValueError as e:
             print(f"无法加载角色 '{role_key}': {e}")
             sys.exit(1)
     else:
         print(f"  当前正在与: The Council (智库模式) 对话")
+        print(f"  {DIM}我会先给你综合回应，再按需展开具体角色。{RESET}")
     
     if session.history:
         print(f"  {DIM}[恢复历史会话，共 {len(session.history)//2} 轮对话]{RESET}")
     
     print(f"  会话ID: {DIM}{session.session_id[:8]}...{RESET}")
     print("  输入 'exit' 或 'quit' 退出。")
+    print(f"  {DIM}更容易聊开的方式：反驳一个前提、讲一个案例、或请我继续追问。{RESET}")
     print("="*50 + "\n")
 
     while True:
@@ -193,11 +345,11 @@ def run_repl(role_key: str | None = None, session_id: str | None = None):
 
             if mode == "single":
                 resp = session.speak_to_role(user_input, role_key)
-                print(f"\n{get_role(role_key)['name']}>\n{resp}")
+                _print_role_response(role_key, resp)
             else:
                 resps = session.speak_to_council(user_input)
-                for k, v in resps.items():
-                    print(f"\n{get_role(k)['name']}>\n{v}")
+                _print_council_digest(resps)
+                _offer_role_expansion(resps)
                 
         except KeyboardInterrupt:
             print("\nGood bye!")

@@ -271,3 +271,162 @@ class TestJudgeAlwaysRuns:
 
         assert state.consensus is not None
         assert "error" in state.consensus
+
+
+# ---------------- Report 范式 ----------------
+
+class TestReportParadigm:
+    def test_single_role_report_skips_review(self, patched_chat):
+        """单角色 Report：只起草不审阅。"""
+        flow_mock, router_mock, judge_mock = patched_chat
+        router_mock.return_value = {"difficulty": "easy", "reasoning": "x"}
+        flow_mock.side_effect = [_stub_role_output("mentor", 0)]
+        judge_mock.return_value = {
+            "headline": "H", "key_points": [], "remaining_tensions": [],
+            "recommended_stance": "",
+        }
+
+        state = run_council("T", "S", "C", paradigm="report")
+
+        assert state.paradigm == "report"
+        assert state.terminated_by == "single_role"
+        assert flow_mock.call_count == 1  # 仅起草 1 次
+        assert state.round_idx == 0
+        assert state.consensus["headline"] == "H"
+
+    def test_multi_role_report_drafter_then_reviewers(self, patched_chat):
+        """多角色 Report：1 起草 + N 审阅，各发言 1 次，无 midcheck。"""
+        flow_mock, router_mock, judge_mock = patched_chat
+        router_mock.return_value = {"difficulty": "hard", "reasoning": "x"}
+        flow_mock.side_effect = [_stub_role_output("c", i) for i in range(20)]
+        judge_mock.return_value = {
+            "headline": "Report", "key_points": ["k1"],
+            "remaining_tensions": [], "recommended_stance": "采纳",
+        }
+
+        state = run_council("T", "S", "C", paradigm="report")
+
+        assert state.paradigm == "report"
+        assert state.terminated_by == "reviewed"
+        # hard = 3 角色：1 起草（synthesizer）+ 2 审阅（critic + mentor）= 3 次
+        assert flow_mock.call_count == 3
+        # 单轮 rebuttal，round_idx = 1
+        assert state.round_idx == 1
+        # midcheck 不应被调用（Report 不做对抗式收敛）
+        assert judge_mock.call_count == 1  # 只有 finalize
+
+    def test_report_drafter_uses_synthesizer_first(self, patched_chat):
+        """Report 默认选 synthesizer 作为起草人。"""
+        flow_mock, router_mock, judge_mock = patched_chat
+        router_mock.return_value = {"difficulty": "medium", "reasoning": "x"}
+        flow_mock.side_effect = [_stub_role_output("c", i) for i in range(20)]
+        judge_mock.return_value = {
+            "headline": "H", "key_points": [], "remaining_tensions": [],
+            "recommended_stance": "",
+        }
+
+        state = run_council("T", "S", "C", paradigm="report")
+
+        # medium = critic + mentor（无 synthesizer），起草人回退为 critic（第一个角色）
+        assert state.terminated_by == "reviewed"
+        # 第一个发言（opening）应为起草人
+        drafter_turn = state.turns[0]
+        assert drafter_turn.phase == Phase.OPENING
+
+
+# ---------------- 范式注册表 ----------------
+
+class TestParadigmRegistry:
+    def test_list_paradigms_includes_defaults(self):
+        from src.council.registry import list_paradigms
+        names = list_paradigms()
+        assert "debate" in names
+        assert "report" in names
+
+    def test_get_paradigm_returns_class(self):
+        from src.council.registry import get_paradigm
+        from src.council.paradigms import DebateParadigm, ReportParadigm
+        assert get_paradigm("debate") is DebateParadigm
+        assert get_paradigm("report") is ReportParadigm
+
+    def test_unknown_paradigm_falls_back_to_debate(self):
+        from src.council.registry import get_paradigm
+        from src.council.paradigms import DebateParadigm
+        assert get_paradigm("nonexistent") is DebateParadigm
+
+    def test_register_custom_paradigm(self):
+        from src.council.registry import register_paradigm, get_paradigm
+        from src.council.paradigms import DiscussionParadigm
+
+        class MyParadigm(DiscussionParadigm):
+            name = "my"
+            def run_discussion(self, state, council_cfg):
+                state.terminated_by = "custom"
+                return state
+
+        try:
+            register_paradigm("my", MyParadigm)
+            assert get_paradigm("my") is MyParadigm
+        finally:
+            # 清理：避免污染其他测试
+            from src.council.registry import PARADIGMS
+            PARADIGMS.pop("my", None)
+
+    def test_register_rejects_non_subclass(self):
+        from src.council.registry import register_paradigm
+        with pytest.raises(TypeError):
+            register_paradigm("bad", object)  # type: ignore[arg-type]
+
+
+# ---------------- paradigm 持久化 ----------------
+
+class TestParadigmPersistence:
+    def test_save_debate_persists_paradigm(self, tmp_path, monkeypatch):
+        """save_debate 应把 state.paradigm 写入 debates 表，并能读回。"""
+        import os
+        from src.storage import db as dbmod
+        tmp_db = tmp_path / "test.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", str(tmp_db))
+        monkeypatch.setattr("src.storage.db.DB_PATH", str(tmp_db))
+
+        from src.storage.db import init_db, save_debate, get_debate
+        init_db()
+
+        state = DebateState(
+            article_title="T",
+            article_summary="S",
+            article_content="C",
+            difficulty="hard",
+            active_roles=["critic", "mentor"],
+            terminated_by="converged",
+            paradigm="report",
+        )
+        state.consensus = {"headline": "H", "key_points": [], "remaining_tensions": [], "recommended_stance": ""}
+
+        debate_id = save_debate(state, article_id=1)
+        loaded = get_debate(debate_id)
+        assert loaded is not None
+        assert loaded["paradigm"] == "report"
+
+    def test_save_debate_defaults_paradigm_to_debate(self, tmp_path, monkeypatch):
+        """state 无 paradigm 字段时（旧对象）应回退到 debate。"""
+        from src.storage import db as dbmod
+        tmp_db = tmp_path / "test.db"
+        monkeypatch.setattr(dbmod, "DB_PATH", str(tmp_db))
+        monkeypatch.setattr("src.storage.db.DB_PATH", str(tmp_db))
+
+        from src.storage.db import init_db, save_debate, get_debate
+        init_db()
+
+        state = DebateState(
+            article_title="T",
+            article_summary="S",
+            article_content="C",
+            difficulty="medium",
+            active_roles=["mentor"],
+            terminated_by="single_role",
+        )
+        # 不设置 paradigm（保持默认 "debate"）
+        debate_id = save_debate(state)
+        loaded = get_debate(debate_id)
+        assert loaded["paradigm"] == "debate"
