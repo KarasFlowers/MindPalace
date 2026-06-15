@@ -35,6 +35,8 @@ mindpalace/
 │   │   ├── roles.py                # 角色定义 + 工具权限
 │   │   ├── paradigms.py            # 讨论范式（Debate / Report）— 借鉴 MALLM
 │   │   ├── registry.py             # 范式注册表（字符串 → 类映射）
+│   │   ├── protocols.py            # 收敛协议（midcheck/consensus/voting）— 借鉴 MALLM
+│   │   ├── protocol_registry.py    # 协议注册表（字符串 → 类映射）
 │   │   └── output.py               # 结果格式化
 │   │
 │   ├── eval/                       # 评估闭环
@@ -49,11 +51,12 @@ mindpalace/
 │   │
 │   ├── memory/                     # 认知记忆系统
 │   │   ├── __init__.py
-│   │   ├── store.py                # 记忆存储（A-MEM 增强嵌入 + 向量召回 + 关键词回退）
+│   │   ├── store.py                # 记忆存储（A-MEM 增强嵌入 + 向量召回 + agentic 链接遍历）
 │   │   ├── embedder.py             # Embedding 抽象 + OpenAI 实现 + 增强文本构建
+│   │   ├── evolution.py            # 记忆演化引擎（A-MEM link_memories）
 │   │   ├── profiler.py             # 认知画像分析
 │   │   ├── echo.py                 # 回声定位（历史对比）
-│   │   ├── crystallize.py          # 结构化认知结晶（Axiomind 知识金字塔）
+│   │   ├── crystallize.py          # 结构化认知结晶（Axiomind 知识金字塔 + 晋升启发式）
 │   │   ├── brain_export.py         # 认知档案 Markdown 导出（brain/ 目录）
 │   │   └── trajectory.py           # 月度质心漂移分析
 │   │
@@ -85,8 +88,9 @@ mindpalace/
 │   │   ├── types.py                # PromptCard 数据模型
 │   │   ├── library.py              # 卡组加载（data/inquiry/*.json）
 │   │   ├── analysis.py             # 回答分析（LLM 提炼）
-│   │   ├── session.py              # 单次会话流程
-│   │   └── cli.py                  # 交互式子菜单
+│   │   ├── diff.py                 # 基线 diff（Axiomind 暂存区 + 相似历史检测）
+│   │   ├── session.py              # 单次会话流程（含相似提示 + 演化链接）
+│   │   └── cli.py                  # 交互式子菜单（含演化轨迹展示）
 │   │
 │   └── workflows/                  # 端到端流程
 │       ├── __init__.py
@@ -155,9 +159,16 @@ ROUTING → OPENING → REBUTTAL(循环) → JUDGING → DONE
 - `debate`（默认）：对抗式多轮反驳，midcheck 收敛
 - `report`：中心化起草（主起草人生成报告）+ 其他人单轮审阅
 
+**收敛协议**（借鉴 MALLM decision_protocols，仅 debate 范式生效）：
+- `midcheck`（默认）：LLM 判断 should_continue
+- `consensus_threshold`：分歧度 < CONVERGE_THRESHOLD 即收敛
+- `voting`：评估各方立场一致程度
+
 ```bash
-python -m src council --item 1                      # 默认 debate 范式
-python -m src council --item 1 --paradigm report    # Report 范式
+python -m src council --item 1                                  # 默认 debate + midcheck
+python -m src council --item 1 --paradigm report                # Report 范式
+python -m src council --item 1 --protocol voting                # 投票收敛协议
+python -m src council --item 1 --protocol consensus_threshold   # 共识阈值
 ```
 
 ---
@@ -168,16 +179,21 @@ python -m src council --item 1 --paradigm report    # Report 范式
 
 | 文件 | 功能 | 关键类/函数 |
 |------|------|------------|
-| `store.py` | 记忆存储（A-MEM 增强嵌入） | `save_memory()`, `find_related_memories()`, `rebuild_embeddings()` |
+| `store.py` | 记忆存储（A-MEM 增强嵌入 + 链接/访问统计） | `save_memory(link_after_save=)`, `find_related_memories(agentic=)`, `get_memory()`, `update_memory_links()` |
 | `embedder.py` | 向量化 + 增强文本构建 | `Embedder`, `OpenAIEmbedder`, `build_enhanced_text()`, `cosine_similarity()` |
+| `evolution.py` | 记忆演化引擎（A-MEM link_memories） | `link_memories()` — 找邻居→LLM决策→strengthen/update_neighbor |
 | `profiler.py` | 认知画像 | `profile_response()`, `CognitiveProfile` |
 | `echo.py` | 回声定位 | `generate_echo_report()`, `EchoReport` |
-| `crystallize.py` | 结构化认知结晶（Axiomind 知识金字塔） | `crystallize_if_needed()` |
+| `crystallize.py` | 结构化认知结晶（Axiomind 知识金字塔 + 晋升启发式） | `crystallize_if_needed()`, `render_crystal_terminal()` |
 | `brain_export.py` | 认知档案 Markdown 导出 | `export_brain()` |
 | `trajectory.py` | 轨迹分析 | `compute_trajectory()` |
 
 **A-MEM 增强嵌入**：存储与查询都嵌入拼接后的 `content + stance + keywords + preferences`，
 而非原始内容，显著提升召回质量。`rebuild_embeddings()` 可迁移存量记录。
+
+**A-MEM 记忆演化**：每次保存新记忆可触发 `link_memories()`——找 5 个最近邻居 →
+LLM 决定 `should_evolve` → `strengthen`（建链接）或 `update_neighbor`（更新邻居标签）。
+`find_related_memories(agentic=True)` 支持沿 `links` 遍历扩展召回。`retrieval_count` 记录被召回次数。
 
 **Axiomind 知识金字塔**（结构化结晶输出）：
 ```
@@ -427,7 +443,8 @@ EMBEDDING_MODEL_NAMES=text-embedding-3-small  # 向量化
 
 # 控制参数
 MAX_REBUTTAL_ROUNDS=3                     # 最大反驳轮数
-CONVERGE_THRESHOLD=0.3                    # 分歧度阈值
+CONVERGE_THRESHOLD=0.3                    # 分歧度阈值 / 共识置信度阈值
+COUNCIL_CONVERGENCE_PROTOCOL=midcheck     # 收敛协议：midcheck | consensus_threshold | voting
 CRYSTAL_WINDOW=10                         # 结晶窗口
 MAX_WORKERS=10                            # 并行抓取数
 

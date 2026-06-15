@@ -580,7 +580,8 @@ def _process_council_reflection(article: dict, user_response: str):
     print(format_echo_report(echo, colors=COLORS))
 
 
-def _run_council_experience(article: dict, pause_at_end: bool = False, paradigm: str = "debate"):
+def _run_council_experience(article: dict, pause_at_end: bool = False, paradigm: str = "debate",
+                            convergence_protocol: str | None = None):
     """统一 Council 的展示、回应和反馈体验。"""
     print(f"\n{BOLD}Starting Council discussion for: {article['title']}{RESET}\n")
 
@@ -591,6 +592,7 @@ def _run_council_experience(article: dict, pause_at_end: bool = False, paradigm:
         content=article.get("summary", ""),
         provider_config=cfg,
         paradigm=paradigm,
+        convergence_protocol=convergence_protocol,
     )
 
     debate_id = None
@@ -902,7 +904,9 @@ def cmd_council(args):
         return
 
     paradigm = getattr(args, "paradigm", "debate")
-    _run_council_experience(article, pause_at_end=False, paradigm=paradigm)
+    protocol = getattr(args, "protocol", None)
+    _run_council_experience(article, pause_at_end=False, paradigm=paradigm,
+                            convergence_protocol=protocol)
 
 
 def cmd_reflect(args):
@@ -1765,7 +1769,35 @@ def _open_in_browser(article):
 def _start_council(article):
     """发起议事厅讨论。"""
     paradigm = _prompt_paradigm()
-    _run_council_experience(article, pause_at_end=True, paradigm=paradigm)
+    protocol = _prompt_convergence_protocol() if paradigm == "debate" else None
+    _run_council_experience(article, pause_at_end=True, paradigm=paradigm,
+                            convergence_protocol=protocol)
+
+
+def _prompt_convergence_protocol() -> str:
+    """交互式选择收敛协议（仅 debate 范式有意义）。"""
+    try:
+        choice = questionary.select(
+            "选择收敛协议:",
+            choices=[
+                questionary.Choice(
+                    title="⚖️  中期裁判 (midcheck) — LLM 判断是否继续（默认）",
+                    value="midcheck",
+                ),
+                questionary.Choice(
+                    title="📊 共识阈值 (consensus_threshold) — 分歧度低于阈值即收敛",
+                    value="consensus_threshold",
+                ),
+                questionary.Choice(
+                    title="🗳️  投票 (voting) — 评估各方立场一致程度",
+                    value="voting",
+                ),
+            ],
+            use_arrow_keys=True,
+        ).ask()
+    except (EOFError, KeyboardInterrupt):
+        return "midcheck"
+    return choice or "midcheck"
 
 
 def _interactive_view():
@@ -2254,6 +2286,12 @@ def main():
         choices=("debate", "report"),
         default="debate",
         help="Discussion paradigm: debate (adversarial, default) or report (draft + review)",
+    )
+    council_parser.add_argument(
+        "--protocol",
+        choices=("midcheck", "consensus_threshold", "voting"),
+        default=None,
+        help="Convergence protocol: midcheck (default), consensus_threshold, or voting",
     )
     council_parser.set_defaults(func=cmd_council)
 

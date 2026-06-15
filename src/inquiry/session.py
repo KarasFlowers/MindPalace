@@ -73,6 +73,22 @@ def print_analysis(analysis: dict) -> None:
         print(f"\n  {YELLOW}继续追问: {analysis['followup_question']}{RESET}")
 
 
+def _print_similarity_prompt(similar_info: dict) -> None:
+    """当检测到与历史回答相似时，打印提示（Axiomind 基线 diff）。"""
+    historical = similar_info["historical"]
+    diff = similar_info["diff"]
+    created = (historical.get("created_at") or "")[:10]
+    prev_response = (historical.get("user_response") or "").replace("\n", " ").strip()[:80]
+    what_changed = diff.get("what_changed", "")
+
+    print(f"\n{YELLOW}\U0001f501 你在 {created} 也回答过类似问题{RESET}")
+    if prev_response:
+        print(f"{DIM}  当时你说：{prev_response}{RESET}")
+    if what_changed:
+        print(f"{YELLOW}  变化：{what_changed}{RESET}")
+    print()
+
+
 def save_inquiry_memory(card: PromptCard, user_response: str, provider_config: dict | None = None) -> int:
     """将一次心智漫游回答写入长期记忆。"""
     cfg = provider_config or get_memory_config()
@@ -92,6 +108,18 @@ def save_inquiry_memory(card: PromptCard, user_response: str, provider_config: d
             topic_keywords=card.tags,
             stance_summary=user_response[:60],
         )
+
+    # 基线 diff：检查是否有相似的历史回答（Axiomind 暂存区模式）
+    similar_info = None
+    try:
+        from src.inquiry.diff import check_and_describe_similarity
+        similar_info = check_and_describe_similarity(card.id, user_response, provider_config=cfg)
+    except Exception as exc:
+        logger.warning("Inquiry diff check failed: %s", exc)
+
+    if similar_info and similar_info["diff"]["is_similar"]:
+        _print_similarity_prompt(similar_info)
+
     memory_id = save_memory(
         article_id=None,
         article_title=f"[心智漫游] {card.title}",

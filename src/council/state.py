@@ -75,6 +75,7 @@ class DebateState:
     max_rebuttal_rounds: int = 3
     converge_threshold: float = 0.3
     paradigm: str = "debate"  # 讨论范式标识（debate / report / ...）
+    convergence_protocol: str = "midcheck"  # 收敛协议（midcheck / consensus_threshold / voting）
 
     # ---------- 向后兼容访问器 ----------
 

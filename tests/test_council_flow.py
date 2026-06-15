@@ -430,3 +430,170 @@ class TestParadigmPersistence:
         debate_id = save_debate(state)
         loaded = get_debate(debate_id)
         assert loaded["paradigm"] == "debate"
+
+
+# ---------------- 收敛协议 ----------------
+
+class TestConvergenceProtocols:
+    """测试 3 个收敛协议的 check 逻辑。"""
+
+    def _make_state(self):
+        return DebateState(
+            article_title="T", article_summary="S", article_content="C",
+            difficulty="hard", active_roles=["critic", "mentor"],
+        )
+
+    @patch("src.council.judge.chat_json")
+    def test_midcheck_protocol_converges_when_should_continue_false(self, mock_judge):
+        """midcheck：should_continue=False → converged=True。"""
+        from src.council.protocols import MidcheckProtocol
+        mock_judge.return_value = {
+            "disagreement_score": 0.1, "should_continue": False, "next_focus": "",
+        }
+        state = self._make_state()
+        result = MidcheckProtocol().check(state, council_cfg={})
+        assert result["converged"] is True
+        assert result["reason"] == "converged"
+        assert result["score"] == 0.1
+
+    @patch("src.council.judge.chat_json")
+    def test_midcheck_protocol_continues_when_should_continue_true(self, mock_judge):
+        """midcheck：should_continue=True → converged=False。"""
+        from src.council.protocols import MidcheckProtocol
+        mock_judge.return_value = {
+            "disagreement_score": 0.8, "should_continue": True, "next_focus": "x",
+        }
+        state = self._make_state()
+        result = MidcheckProtocol().check(state, council_cfg={})
+        assert result["converged"] is False
+        assert result["reason"] == ""
+
+    @patch("src.council.judge.chat_json")
+    def test_consensus_threshold_converges_below_threshold(self, mock_judge):
+        """consensus_threshold：disagreement < CONVERGE_THRESHOLD → converged。"""
+        from src.council.protocols import ConsensusThresholdProtocol
+        from src.config import CONVERGE_THRESHOLD
+        # 设一个低于阈值的分歧度
+        mock_judge.return_value = {
+            "disagreement_score": max(0.0, CONVERGE_THRESHOLD - 0.1),
+            "should_continue": True,  # 注意：即使 should_continue=True 也应收敛
+            "next_focus": "",
+        }
+        state = self._make_state()
+        result = ConsensusThresholdProtocol().check(state, council_cfg={})
+        assert result["converged"] is True
+        assert result["reason"] == "consensus_threshold"
+
+    @patch("src.council.judge.chat_json")
+    def test_consensus_threshold_continues_above_threshold(self, mock_judge):
+        """consensus_threshold：disagreement >= CONVERGE_THRESHOLD → 不收敛。"""
+        from src.council.protocols import ConsensusThresholdProtocol
+        from src.config import CONVERGE_THRESHOLD
+        mock_judge.return_value = {
+            "disagreement_score": CONVERGE_THRESHOLD + 0.1,
+            "should_continue": False,  # 即使 should_continue=False，分歧度高也不收敛
+            "next_focus": "",
+        }
+        state = self._make_state()
+        result = ConsensusThresholdProtocol().check(state, council_cfg={})
+        assert result["converged"] is False
+
+    @patch("src.council.protocols.chat_json")
+    def test_voting_protocol_converges_high_confidence(self, mock_vote):
+        """voting：consensus_confidence >= 阈值 → converged。"""
+        from src.council.protocols import VotingProtocol
+        from src.config import CONVERGE_THRESHOLD
+        mock_vote.return_value = {
+            "consensus_confidence": CONVERGE_THRESHOLD + 0.2,
+            "main_remaining_divergence": "",
+        }
+        state = self._make_state()
+        result = VotingProtocol().check(state, council_cfg={})
+        assert result["converged"] is True
+        assert result["reason"] == "voting_consensus"
+
+    @patch("src.council.protocols.chat_json", side_effect=RuntimeError("LLM down"))
+    def test_voting_protocol_fallback_on_failure(self, _mock):
+        """voting：LLM 失败应保守继续（不收敛）。"""
+        from src.council.protocols import VotingProtocol
+        state = self._make_state()
+        result = VotingProtocol().check(state, council_cfg={})
+        assert result["converged"] is False
+
+
+class TestProtocolRegistry:
+    def test_list_protocols_includes_defaults(self):
+        from src.council.protocol_registry import list_protocols
+        names = list_protocols()
+        assert "midcheck" in names
+        assert "consensus_threshold" in names
+        assert "voting" in names
+
+    def test_get_protocol_returns_instance(self):
+        from src.council.protocol_registry import get_protocol
+        from src.council.protocols import MidcheckProtocol
+        inst = get_protocol("midcheck")
+        assert isinstance(inst, MidcheckProtocol)
+
+    def test_unknown_protocol_falls_back_to_midcheck(self):
+        from src.council.protocol_registry import get_protocol
+        from src.council.protocols import MidcheckProtocol
+        inst = get_protocol("nonexistent")
+        assert isinstance(inst, MidcheckProtocol)
+
+    def test_register_custom_protocol(self):
+        from src.council.protocol_registry import register_protocol, get_protocol, PROTOCOLS
+        from src.council.protocols import ConvergenceProtocol
+
+        class MyProtocol(ConvergenceProtocol):
+            name = "my"
+            def check(self, state, council_cfg):
+                return {"converged": True, "reason": "custom", "score": 0.0}
+
+        try:
+            register_protocol("my", MyProtocol)
+            inst = get_protocol("my")
+            assert isinstance(inst, MyProtocol)
+        finally:
+            PROTOCOLS.pop("my", None)
+
+    def test_register_rejects_non_subclass(self):
+        from src.council.protocol_registry import register_protocol
+        with pytest.raises(TypeError):
+            register_protocol("bad", object)  # type: ignore[arg-type]
+
+
+# ---------------- DebateParadigm 协议集成 ----------------
+
+class TestDebateParadigmWithProtocols:
+    def test_debate_uses_midcheck_by_default(self, patched_chat):
+        """默认 convergence_protocol=midcheck，行为与重构前一致。"""
+        flow_mock, router_mock, judge_mock = patched_chat
+        router_mock.return_value = {"difficulty": "hard", "reasoning": "x"}
+        flow_mock.side_effect = [_stub_role_output("c", i) for i in range(100)]
+        judge_mock.side_effect = [
+            {"disagreement_score": 0.1, "should_continue": False, "next_focus": ""},
+            {"headline": "H", "key_points": [], "remaining_tensions": [], "recommended_stance": ""},
+        ]
+        state = run_council("T", "S", "C")
+        assert state.terminated_by == "converged"
+        assert state.convergence_protocol == "midcheck"
+
+    def test_debate_with_voting_protocol(self, patched_chat):
+        """使用 voting 协议时应通过 VotingProtocol 收敛。"""
+        flow_mock, router_mock, judge_mock = patched_chat
+        router_mock.return_value = {"difficulty": "hard", "reasoning": "x"}
+        flow_mock.side_effect = [_stub_role_output("c", i) for i in range(100)]
+        # VotingProtocol 调用 src.council.protocols.chat_json，与 judge_mock（judge.chat_json）不同
+        # 这里让 voting 立即收敛
+        with patch("src.council.protocols.chat_json") as mock_vote:
+            mock_vote.return_value = {
+                "consensus_confidence": 0.9, "main_remaining_divergence": "",
+            }
+            judge_mock.side_effect = [
+                {"headline": "H", "key_points": [], "remaining_tensions": [], "recommended_stance": ""},
+            ]
+            state = run_council("T", "S", "C", convergence_protocol="voting")
+
+        assert state.convergence_protocol == "voting"
+        assert state.terminated_by == "voting_consensus"
