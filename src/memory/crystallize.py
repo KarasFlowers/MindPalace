@@ -213,8 +213,31 @@ def _save_crystal(crystal: dict, anchor_id: int, window: int) -> int:
 
 
 def _format_memories_for_prompt(memories: list[dict]) -> str:
-    """将 memory 列表格式化为 LLM 输入文本。"""
+    """将 memory 列表格式化为 LLM 输入文本。
+
+    额外注入"重复主题"摘要：同一 source_id 出现 ≥ 2 次的主题（Axiomind
+    跨日期重复启发式），提示 LLM 这些反复出现的模式更可能晋升为 principle/axiom。
+    """
     parts = []
+
+    # 重复主题检测（晋升启发式）
+    source_counts: dict[str, int] = {}
+    for m in memories:
+        sid = m.get("source_id")
+        if sid:
+            source_counts[sid] = source_counts.get(sid, 0) + 1
+    repeated = {sid: c for sid, c in source_counts.items() if c >= 2}
+    if repeated:
+        parts.append("=== 重复主题（跨多次回答反复出现，更可能晋升为 principle/axiom）===")
+        for sid, count in sorted(repeated.items(), key=lambda x: -x[1]):
+            # 找该主题的标题
+            title = next(
+                (m.get("article_title", sid) for m in memories if m.get("source_id") == sid),
+                sid,
+            )
+            parts.append(f"  - {title}（{count} 次回答）")
+        parts.append("")
+
     for i, m in enumerate(memories, 1):
         parts.append(
             f"--- 记忆 #{i} ---\n"

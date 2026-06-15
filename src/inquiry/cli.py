@@ -17,6 +17,7 @@ DIM = "\033[2m"
 CYAN = "\033[36m"
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
 RESET = "\033[0m"
 
 _KIND_LABELS = {
@@ -31,19 +32,42 @@ def _require_questionary():
         raise RuntimeError("Interactive mode requires 'questionary'. Run `pip install -e .` first.")
 
 
-def _print_inquiry_memories(limit: int = 20) -> None:
+def _print_inquiry_memories(limit: int = 30) -> None:
+    """展示心智漫游回答——按问题卡分组显示演化轨迹（Axiomind cross-date pattern）。"""
     memories = get_memories_by_source(limit=limit)
     if not memories:
         print(f"\n{YELLOW}还没有心智漫游回答。{RESET}\n")
         return
 
-    print(f"\n{BOLD}{CYAN}[心智漫游回答]{RESET}\n")
+    # 按 source_id（问题卡）分组
+    groups: dict[str, list[dict]] = {}
     for item in memories:
-        label = _KIND_LABELS.get(item.get("source_type"), item.get("source_type", "unknown"))
-        title = item.get("article_title", "").replace("[心智漫游] ", "")
-        response = (item.get("user_response") or "").replace("\n", " ")
-        print(f"  {BOLD}#{item['id']} [{label}] {title}{RESET}")
-        print(f"  {DIM}{item.get('created_at', '')[:16]} | {response[:100]}{RESET}\n")
+        sid = item.get("source_id") or "(无问题卡)"
+        groups.setdefault(sid, []).append(item)
+
+    print(f"\n{BOLD}{CYAN}[心智漫游回答轨迹]{RESET}")
+    print(f"{DIM}共 {len(memories)} 条回答，{len(groups)} 个主题{RESET}\n")
+
+    for sid, items in groups.items():
+        # 每组按时间正序（旧→新）展示变迁
+        items.sort(key=lambda m: m.get("created_at") or "")
+        first = items[0]
+        label = _KIND_LABELS.get(first.get("source_type"), first.get("source_type", "unknown"))
+        title = first.get("article_title", "").replace("[心智漫游] ", "")
+
+        print(f"  {BOLD}{MAGENTA}▍ {title}{RESET} {DIM}[{label}] × {len(items)} 次{RESET}")
+        for i, item in enumerate(items):
+            created = (item.get("created_at") or "")[:10]
+            response = (item.get("user_response") or "").replace("\n", " ").strip()
+            stance = (item.get("stance_summary") or "").replace("\n", " ").strip()
+            arrow = f"{GREEN}→{RESET}" if i == 0 else f"{YELLOW}↻{RESET}"
+            line = f"    {arrow} {DIM}{created}{RESET} "
+            if stance:
+                line += f"{DIM}立场：{stance[:40]}{RESET}"
+            print(line)
+            if response:
+                print(f"      {DIM}{response[:90]}{RESET}")
+        print(f"  {DIM}{'─' * 50}{RESET}\n")
 
 
 def run_inquiry_menu() -> None:
