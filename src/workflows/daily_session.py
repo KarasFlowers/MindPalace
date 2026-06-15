@@ -143,6 +143,8 @@ def run_daily_session():
             article_title=top_article.title,
             user_response=user_response,
             profile=profile,
+            # daily_session 末尾批量触发演化（见下方 link_memories 调用），
+            # 此处不开 link_after_save 以避免与 echo 报告并行竞争。
         )
 
         # 回声定位
@@ -162,6 +164,19 @@ def run_daily_session():
         logging.getLogger("src.memory.echo").setLevel(logging.INFO)
 
         print(format_echo_report(echo, colors=COLORS))
+
+        # 记忆演化（A-MEM）：为本次新增记忆与历史记忆建立链接
+        try:
+            from src.memory.evolution import link_memories
+
+            result = link_memories(memory_id, provider_config=memory_cfg)
+            if result.get("evolved"):
+                print(
+                    f"  {DIM}\U0001f9e0 记忆演化：建立 {result['links_created']} 条链接，"
+                    f"更新 {result['neighbors_updated']} 个邻居{RESET}"
+                )
+        except Exception:
+            logger.exception("Memory evolution failed")
 
         # 认知固化检查
         try:
