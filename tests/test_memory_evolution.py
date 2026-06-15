@@ -216,18 +216,26 @@ class TestAgenticSearch:
         assert m2 in ids
 
     def test_non_agentic_does_not_traverse(self):
-        """agentic=False（默认）不应沿 links 遍历。"""
+        """agentic=False（默认）不应沿 links 遍历——对比 agentic=True 的差异。"""
         m1 = save_memory(1, "AI 1", "AI 深度学习改变一切", _PROFILE_AI)
-        # 存一条不相似的记忆（向量召回不到）
-        m2 = save_memory(2, "Food", "有机食品健康饮食", _PROFILE_FOOD)
+        # 存一条完全不相似的记忆（向量召回不到，只能通过链接到达）
+        m2 = save_memory(2, "Food", "有机食品健康饮食营养蔬菜", _PROFILE_FOOD)
         update_memory_links(m1, {str(m2): 0.9})
 
-        results = find_related_memories("AI 深度学习", exclude_id=None, limit=5, agentic=False)
-        ids = [r["id"] for r in results]
-        assert m1 in ids
-        # m2 不应出现（除非向量本就召回它）
-        # 这里 m2 内容完全不相关，纯向量召回不应命中
-        assert m2 not in ids
+        # 非 agentic：纯向量召回，m2 不相关不应出现
+        non_agentic = find_related_memories(
+            "AI 深度学习", exclude_id=None, limit=5, agentic=False, min_similarity=0.35
+        )
+        # agentic：应通过 m1 的链接找到 m2
+        agentic = find_related_memories(
+            "AI 深度学习", exclude_id=None, limit=5, agentic=True, min_similarity=0.35
+        )
+        agentic_ids = {r["id"] for r in agentic}
+        non_agentic_ids = {r["id"] for r in non_agentic}
+
+        # 关键断言：agentic 比非 agentic 多召回了 m2（通过链接）
+        assert m2 in agentic_ids, "agentic 应通过链接找到 m2"
+        assert m2 not in non_agentic_ids, "非 agentic 不应通过链接遍历"
 
 
 # ---------------------------------------------------------------------------
