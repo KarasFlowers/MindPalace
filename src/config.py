@@ -135,6 +135,7 @@ ARTICLE_AUTO_CLEANUP = os.getenv("ARTICLE_AUTO_CLEANUP", "true").lower() in {"1"
 # --- Council 辩论参数 ---
 MAX_REBUTTAL_ROUNDS = int(os.getenv("MAX_REBUTTAL_ROUNDS", "3"))
 CONVERGE_THRESHOLD = float(os.getenv("CONVERGE_THRESHOLD", "0.3"))
+COUNCIL_CONVERGENCE_PROTOCOL = (os.getenv("COUNCIL_CONVERGENCE_PROTOCOL", "midcheck")).strip().lower()
 
 # --- Memory 参数 ---
 CRYSTAL_WINDOW = int(os.getenv("CRYSTAL_WINDOW", "10"))

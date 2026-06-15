@@ -24,6 +24,7 @@ import logging
 
 from src.config import (
     CONVERGE_THRESHOLD,
+    COUNCIL_CONVERGENCE_PROTOCOL,
     MAX_REBUTTAL_ROUNDS,
     get_council_config,
 )
@@ -51,6 +52,7 @@ def run_council(
     max_rebuttal_rounds: int | None = None,
     converge_threshold: float | None = None,
     paradigm: str = "debate",
+    convergence_protocol: str | None = None,
 ) -> DebateState:
     """运行一次完整的议事厅辩论。
 
@@ -64,6 +66,9 @@ def run_council(
         converge_threshold: 覆盖默认的分歧度阈值（来自 .env CONVERGE_THRESHOLD）。
         paradigm: 讨论范式（debate / report / ...）。未知名称回退到 debate。
             借鉴 MALLM 的 discussion_paradigms，通过 registry.py 注册。
+        convergence_protocol: 收敛协议（midcheck / consensus_threshold / voting）。
+            None 时从 .env COUNCIL_CONVERGENCE_PROTOCOL 读取（默认 midcheck）。
+            借鉴 MALLM 的 decision_protocols，通过 protocol_registry.py 注册。
 
     Returns:
         DebateState：包含完整辩论过程与 Judge 共识结果。
@@ -84,6 +89,7 @@ def run_council(
                 CONVERGE_THRESHOLD if converge_threshold is None else converge_threshold
             ),
             paradigm=paradigm,
+            convergence_protocol=convergence_protocol or COUNCIL_CONVERGENCE_PROTOCOL,
         )
 
         council_cfg = provider_config or get_council_config()

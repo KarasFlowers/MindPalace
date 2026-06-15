@@ -15,7 +15,6 @@ from abc import ABC, abstractmethod
 
 from src.config import CONVERGE_THRESHOLD, MAX_REBUTTAL_ROUNDS
 from src.council.judge import finalize as judge_finalize
-from src.council.judge import midcheck as judge_midcheck
 from src.council.rebuttal import build_opening_prompt, build_rebuttal_prompt
 from src.council.roles import get_role, TOOL_ENABLED_ROLES
 from src.council.state import DebateState, Phase, Turn
@@ -185,10 +184,13 @@ class DebateParadigm(DiscussionParadigm):
                     state.terminated_by = "max_rounds"
                     break
 
-                check = judge_midcheck(state)
-                state.disagreement_score = check["disagreement_score"]
-                if not check["should_continue"]:
-                    state.terminated_by = "converged"
+                # 收敛检查：通过可插拔协议（默认 midcheck，向后兼容）
+                from src.council.protocol_registry import get_protocol
+                protocol = get_protocol(state.convergence_protocol)
+                result = protocol.check(state, council_cfg)
+                state.disagreement_score = result["score"]
+                if result["converged"]:
+                    state.terminated_by = result["reason"] or "converged"
                     break
         else:
             state.terminated_by = (
