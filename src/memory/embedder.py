@@ -77,6 +77,14 @@ def get_embedder() -> Embedder:
     api_key = cfg.get("api_key") or ""
     base_url = cfg.get("base_url") or "https://api.openai.com/v1"
     model = (cfg.get("models") or ["text-embedding-3-small"])[0]
+    provider_type = (cfg.get("provider_type") or "openai").strip().lower()
+
+    if provider_type == "anthropic":
+        raise RuntimeError(
+            "Embedding Provider 不能使用 Anthropic 官方 Claude 接口。"
+            "请单独配置 EMBEDDING_BASE_URL 为 OpenAI 兼容的 embeddings 接口，"
+            "或清空 EMBEDDING_PROVIDER_TYPE/EMBEDDING_BASE_URL 后使用默认 OpenAI 兼容配置。"
+        )
 
     _embedder = OpenAIEmbedder(api_key=api_key, base_url=base_url, model=model)
     logger.info("[Embedder] Initialized: model=%s, base_url=%s", model, base_url)
