@@ -220,6 +220,10 @@ class TestAgenticSearch:
         m1 = save_memory(1, "AI 1", "AI 深度学习改变一切", _PROFILE_AI)
         # 存一条完全不相似的记忆（向量召回不到，只能通过链接到达）
         m2 = save_memory(2, "Food", "有机食品健康饮食营养蔬菜", _PROFILE_FOOD)
+        from src.memory.store import _get_conn
+        with _get_conn() as conn:
+            conn.execute("UPDATE memories SET embedding = NULL WHERE id = ?", (m2,))
+            conn.commit()
         update_memory_links(m1, {str(m2): 0.9})
 
         # 非 agentic：纯向量召回，m2 不相关不应出现

@@ -12,27 +12,82 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = PROJECT_ROOT / "mindpalace.db"
 
 # --- LLM ---
+def _normalize_profile_name(value: str | None) -> str:
+    """Normalize a user-facing profile name into an env-safe slug."""
+    if not value:
+        return ""
+    return re.sub(r"[^A-Z0-9]+", "_", value.strip().upper()).strip("_")
+
+
+def _profile_env_key(profile_name: str | None, field: str) -> str:
+    return f"API_PROFILE_{_normalize_profile_name(profile_name)}_{field}"
+
+
+def _infer_provider_type(base_url: str | None, explicit: str | None = None) -> str:
+    """Return the provider protocol adapter name."""
+    if explicit:
+        normalized = explicit.strip().lower()
+        if normalized in {"anthropic", "claude"}:
+            return "anthropic"
+        return "openai"
+
+    lowered = (base_url or "").lower()
+    if "anthropic.com" in lowered:
+        return "anthropic"
+    return "openai"
+
+
 def get_provider_config(prefix: str = "OPENAI") -> dict:
     """获取指定前缀的 Provider 配置，如果缺失则回退到 OPENAI 前缀。"""
-    
+    profile_name = os.getenv(f"{prefix}_PROVIDER_PROFILE")
+
     # 尝试特定的 API KEY
-    api_key = os.getenv(f"{prefix}_API_KEY")
+    api_key = os.getenv(f"{prefix}_API_KEY") or (
+        os.getenv(_profile_env_key(profile_name, "API_KEY")) if profile_name else None
+    )
     if not api_key and prefix != "OPENAI":
         api_key = os.getenv("OPENAI_API_KEY")
 
     # 尝试特定的 BASE URL
-    base_url = os.getenv(f"{prefix}_BASE_URL")
+    base_url = os.getenv(f"{prefix}_BASE_URL") or (
+        os.getenv(_profile_env_key(profile_name, "BASE_URL")) if profile_name else None
+    )
     if not base_url and prefix != "OPENAI":
         base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     elif not base_url:
         base_url = "https://api.openai.com/v1"
 
+    provider_type = os.getenv(f"{prefix}_PROVIDER_TYPE") or (
+        os.getenv(_profile_env_key(profile_name, "PROVIDER_TYPE")) if profile_name else None
+    )
+    if (
+        not provider_type
+        and prefix != "OPENAI"
+        and not os.getenv(f"{prefix}_BASE_URL")
+    ):
+        provider_type = os.getenv("OPENAI_PROVIDER_TYPE")
+
     # 尝试特定的模型列表
-    models_raw = os.getenv(f"{prefix}_MODEL_NAMES") or os.getenv(f"{prefix}_MODEL_NAME")
+    models_raw = (
+        os.getenv(f"{prefix}_MODEL_NAMES")
+        or os.getenv(f"{prefix}_MODEL_NAME")
+        or (os.getenv(_profile_env_key(profile_name, "MODEL_NAMES")) if profile_name else None)
+        or (os.getenv(_profile_env_key(profile_name, "MODEL_NAME")) if profile_name else None)
+    )
     if not models_raw and prefix == "OPENAI":
-        models_raw = os.getenv("MODEL_NAMES") or os.getenv("MODEL_NAME")
+        models_raw = (
+            os.getenv("OPENAI_MODEL_NAMES")
+            or os.getenv("MODEL_NAMES")
+            or os.getenv("OPENAI_MODEL_NAME")
+            or os.getenv("MODEL_NAME")
+        )
     if not models_raw and prefix != "OPENAI":
-        models_raw = os.getenv("MODEL_NAMES") or os.getenv("MODEL_NAME")
+        models_raw = (
+            os.getenv("OPENAI_MODEL_NAMES")
+            or os.getenv("MODEL_NAMES")
+            or os.getenv("OPENAI_MODEL_NAME")
+            or os.getenv("MODEL_NAME")
+        )
     
     models = [m.strip() for m in (models_raw or "").split(",") if m.strip()]
 
@@ -40,6 +95,8 @@ def get_provider_config(prefix: str = "OPENAI") -> dict:
         "api_key": api_key,
         "base_url": base_url,
         "models": models,
+        "provider_type": _infer_provider_type(base_url, provider_type),
+        "provider_profile": profile_name,
     }
 
 # 默认主配置
@@ -86,9 +143,9 @@ FEED_PRESETS = {
     "humanities": [
         "https://aeon.co/feed.rss",
         "https://psyche.co/feed.rss",
-        "https://blogs.lse.ac.uk/impactofsocialsciences/feed/",
-        "https://blogs.lse.ac.uk/politicsandpolicy/feed/",
-        "https://www.publicbooks.org/feed/",
+        "https://daily.jstor.org/feed/",
+        "https://thepointmag.com/feed/",
+        "https://www.noemamag.com/feed/",
         "https://crookedtimber.org/feed/",
     ],
     "mixed": [

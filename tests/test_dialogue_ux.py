@@ -106,3 +106,28 @@ def test_extract_role_highlight_prefers_structured_fields():
 
     highlight = engine._extract_role_highlight("critic", critic_response)
     assert "个体选择看得过于自由" in highlight
+
+
+def test_interactive_resolve_restores_full_session_id():
+    from src import app
+
+    full_id = "12345678-abcd-4def-9000-abcdef123456"
+    sessions = [
+        {
+            "id": full_id,
+            "title": "旧会话",
+            "mode": "council",
+            "updated_at": "2026-06-24T12:00:00",
+        }
+    ]
+
+    with patch("src.resolve.engine.list_sessions", return_value=sessions), \
+         patch("src.resolve.engine.run_repl") as mock_run_repl, \
+         patch("src.app.questionary.select") as mock_select:
+        mock_select.return_value.ask.side_effect = [
+            "📜 查看并恢复历史会话",
+            "[12345678...] 旧会话 (council) - 2026-06-24",
+        ]
+        app._interactive_resolve()
+
+    mock_run_repl.assert_called_once_with(session_id=full_id)

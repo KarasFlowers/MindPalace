@@ -3,7 +3,6 @@
 import json
 import logging
 import uuid
-import sys
 from datetime import datetime, timezone
 
 from src.llm.client import chat
@@ -310,35 +309,38 @@ def run_repl(role_key: str | None = None, session_id: str | None = None):
     """启动交互式终端。"""
     mode = "single" if role_key else "council"
     session = ResolveSession(session_id=session_id, mode=mode) if session_id else ResolveSession(mode=mode)
-    
+
     print("\n" + "="*50)
     print(" 🧠 MindPalace Resolve Space ".center(50))
     print("="*50)
-    
+
     if mode == "single":
         try:
             role = get_role(role_key)
             print(f"  当前正在与: {role['name']} 对话")
         except ValueError as e:
-            print(f"无法加载角色 '{role_key}': {e}")
-            sys.exit(1)
+            # 拼错角色名不应让整个程序退出；返回让调用方决定下一步
+            print(f"  {RED}无法加载角色 '{role_key}': {e}{RESET}")
+            print(f"  {DIM}可用角色：critic / synthesizer / mentor{RESET}\n")
+            return
     else:
         print(f"  当前正在与: The Council (智库模式) 对话")
         print(f"  {DIM}我会先给你综合回应，再按需展开具体角色。{RESET}")
-    
+
     if session.history:
         print(f"  {DIM}[恢复历史会话，共 {len(session.history)//2} 轮对话]{RESET}")
-    
+
     print(f"  会话ID: {DIM}{session.session_id[:8]}...{RESET}")
-    print("  输入 'exit' 或 'quit' 退出。")
+    print(f"  {DIM}输入 'exit' 或 'quit' 退出，Ctrl+C 也可中断。{RESET}")
     print(f"  {DIM}更容易聊开的方式：反驳一个前提、讲一个案例、或请我继续追问。{RESET}")
     print("="*50 + "\n")
 
     while True:
         try:
-            user_input = input("\nYou> ").strip()
+            # 统一提示符为 >（与 council / inquiry / daily 一致）
+            user_input = input(f"\n{GREEN}>{RESET} ").strip()
             if user_input.lower() in ("exit", "quit"):
-                print("Good bye!")
+                print(f"{DIM}再见！{RESET}")
                 break
             if not user_input:
                 continue
@@ -350,13 +352,13 @@ def run_repl(role_key: str | None = None, session_id: str | None = None):
                 resps = session.speak_to_council(user_input)
                 _print_council_digest(resps)
                 _offer_role_expansion(resps)
-                
+
         except KeyboardInterrupt:
-            print("\nGood bye!")
+            print(f"\n{DIM}再见！{RESET}")
             break
         except Exception as e:
             logger.exception("Error in REPL")
-            print(f"\n[Error] System encountered an issue: {e}")
+            print(f"\n{RED}[Error] System encountered an issue: {e}{RESET}")
 
 
 def run_sessions_list():

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS article_tags (
 """
 
 _ARTICLE_MIGRATION_COLUMNS = [
+    ("clean_content", "TEXT"),
     ("is_favorite", "INTEGER NOT NULL DEFAULT 0"),
     ("favorited_at", "TEXT"),
     ("favorite_note", "TEXT"),
@@ -159,7 +160,7 @@ def init_db():
 
 
 def _migrate_article_columns(conn: sqlite3.Connection):
-    """为旧 articles 表补齐收藏相关列。"""
+    """为旧 articles 表补齐后续版本新增列。"""
     existing = {row[1] for row in conn.execute("PRAGMA table_info(articles)").fetchall()}
     for col_name, col_type in _ARTICLE_MIGRATION_COLUMNS:
         if col_name not in existing:

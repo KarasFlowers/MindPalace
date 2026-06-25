@@ -22,6 +22,18 @@ class TestScoutFeedConfig:
             assert config.get_default_feeds() == config.FEED_PRESETS["humanities"]
         _reload_config()
 
+    def test_humanities_preset_matches_curated_humanities_sources(self):
+        config = _reload_config()
+        assert config.FEED_PRESETS["humanities"] == [
+            "https://aeon.co/feed.rss",
+            "https://psyche.co/feed.rss",
+            "https://daily.jstor.org/feed/",
+            "https://thepointmag.com/feed/",
+            "https://www.noemamag.com/feed/",
+            "https://crookedtimber.org/feed/",
+        ]
+        _reload_config()
+
     def test_scout_feed_preset_can_switch_to_tech(self):
         with patch.dict(os.environ, {"SCOUT_FEED_PRESET": "tech"}, clear=False):
             os.environ.pop("SCOUT_FEEDS", None)
