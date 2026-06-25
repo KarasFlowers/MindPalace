@@ -101,6 +101,37 @@ class TestArticleLibrary:
             }
         assert "article_tags" in tables
 
+    def test_legacy_articles_table_gets_clean_content_column_migrated(self):
+        from src.storage.db import _get_conn, init_db
+
+        conn = sqlite3.connect(self._tmp.name)
+        conn.execute(
+            """
+            CREATE TABLE articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT UNIQUE NOT NULL,
+                title TEXT NOT NULL,
+                source TEXT NOT NULL,
+                summary TEXT,
+                scores_json TEXT,
+                total_score REAL,
+                reasoning TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+        init_db()
+
+        with _get_conn() as conn2:
+            cols = {
+                row["name"]
+                for row in conn2.execute("PRAGMA table_info(articles)").fetchall()
+            }
+        assert "clean_content" in cols
+
     def test_favorite_article_is_listed_and_protected_from_cleanup(self):
         from src.storage.db import (
             cleanup_old_articles,

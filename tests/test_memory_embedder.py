@@ -11,6 +11,7 @@ import pytest
 from src.memory.embedder import (
     OpenAIEmbedder,
     cosine_similarity,
+    get_embedder,
     vec_to_blob,
     blob_to_vec,
     reset_embedder,
@@ -111,6 +112,18 @@ def _isolated_db():
 # ---------------------------------------------------------------------------
 
 class TestUtilities:
+    def test_get_embedder_rejects_anthropic_provider_type(self):
+        reset_embedder()
+        cfg = {
+            "provider_type": "anthropic",
+            "api_key": "sk-test",
+            "base_url": "https://api.anthropic.com/v1",
+            "models": ["text-embedding-3-small"],
+        }
+        with patch("src.memory.embedder.get_embedding_config", return_value=cfg):
+            with pytest.raises(RuntimeError, match="Embedding Provider 不能使用 Anthropic"):
+                get_embedder()
+
     def test_cosine_identical_vectors(self):
         v = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         assert cosine_similarity(v, v) == pytest.approx(1.0, abs=1e-6)

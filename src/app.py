@@ -66,6 +66,7 @@ from src.memory.store import save_memory, find_related_memories, get_all_memorie
 from src.memory.echo import generate_echo_report, format_echo_report
 from src.workflows.daily_session import run_daily_session
 from src.inquiry.cli import run_inquiry_menu
+from src.ux import PhaseIndicator, Spinner, collect_multiline
 from src.config import (
     ARTICLE_RETENTION_DAYS,
     FEED_PRESETS,
@@ -75,7 +76,7 @@ from src.config import (
     get_council_config,
     get_memory_config,
 )
-from dotenv import set_key, get_key
+from dotenv import dotenv_values, get_key, set_key, unset_key
 import shutil
 
 # ANSI 颜色
@@ -116,6 +117,12 @@ PROVIDER_LABELS = {
 }
 
 PROVIDER_CLI_NAMES = {prefix: cli_name for cli_name, prefix in PROVIDER_PREFIXES.items()}
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+MODEL_LIST_DISPLAY_LIMIT = 25
+CLEAR_CONFIG_SENTINEL = "-"
+API_PROFILE_PREFIX = "API_PROFILE_"
+API_PROFILE_HANDLED = "__handled__"
 
 # Questionary 自定义样式
 custom_style = Style([
@@ -229,6 +236,616 @@ def _format_filter_summary(filters: dict | None, favorites_only: bool = False) -
     if current["days"] is not None:
         parts.append(f"近 {current['days']} 天")
     return " | ".join(parts)
+
+
+def _mask_api_key(value: str | None) -> str:
+    if not value:
+        return "未设置"
+    text = str(value).strip()
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:5]}...{text[-3:]}"
+
+
+def _split_models(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    return [item.strip() for item in str(raw).split(",") if item.strip()]
+
+
+def _join_models(models: list[str] | None) -> str:
+    return ", ".join(models or [])
+
+
+def _normalize_profile_name(value: str | None) -> str:
+    if not value:
+        return ""
+    import re
+    return re.sub(r"[^A-Z0-9]+", "_", value.strip().upper()).strip("_")
+
+
+def _profile_env_key(profile_name: str | None, field: str) -> str:
+    return f"{API_PROFILE_PREFIX}{_normalize_profile_name(profile_name)}_{field}"
+
+
+def _profile_display_name(profile_name: str | None) -> str:
+    normalized = _normalize_profile_name(profile_name)
+    return normalized.lower() if normalized else ""
+
+
+def _normalize_provider_type(value: str | None, base_url: str | None = None) -> str:
+    if value:
+        normalized = value.strip().lower()
+        if normalized in {"anthropic", "claude"}:
+            return "anthropic"
+        return "openai"
+    if "anthropic.com" in (base_url or "").lower():
+        return "anthropic"
+    return "openai"
+
+
+def _resolve_provider_type_for_config(
+    explicit_value: str | None,
+    base_url: str | None,
+    inherited_value: str | None = None,
+) -> str:
+    """Use explicit type first, otherwise infer from the effective URL before inheriting."""
+    if explicit_value:
+        return _normalize_provider_type(explicit_value)
+    inferred = _normalize_provider_type(None, base_url)
+    if inferred != "openai":
+        return inferred
+    return _normalize_provider_type(inherited_value, base_url)
+
+
+def _read_env_values(env_path: Path) -> dict[str, str]:
+    """Read .env without python-dotenv's per-missing-key warnings."""
+    if not env_path.exists():
+        return {}
+    return {
+        key: value
+        for key, value in dotenv_values(env_path).items()
+        if key and value is not None
+    }
+
+
+def _env_get(env_values: dict[str, str], key: str) -> str | None:
+    value = env_values.get(key)
+    if value is None:
+        return None
+    return str(value)
+
+
+def _list_api_profiles(env_path: Path) -> dict[str, dict]:
+    env_values = _read_env_values(env_path)
+    profile_names: set[str] = set()
+    suffixes = ("PROVIDER_TYPE", "API_KEY", "BASE_URL", "MODEL_NAMES", "MODEL_NAME")
+
+    for key in env_values:
+        if not key.startswith(API_PROFILE_PREFIX):
+            continue
+        tail = key[len(API_PROFILE_PREFIX):]
+        for suffix in suffixes:
+            marker = f"_{suffix}"
+            if tail.endswith(marker):
+                profile_names.add(tail[: -len(marker)])
+                break
+
+    profiles: dict[str, dict] = {}
+    for name in sorted(profile_names):
+        raw_models = (
+            _env_get(env_values, _profile_env_key(name, "MODEL_NAMES"))
+            or _env_get(env_values, _profile_env_key(name, "MODEL_NAME"))
+            or ""
+        )
+        base_url = _env_get(env_values, _profile_env_key(name, "BASE_URL")) or ""
+        provider_type = _normalize_provider_type(
+            _env_get(env_values, _profile_env_key(name, "PROVIDER_TYPE")),
+            base_url,
+        )
+        profiles[name] = {
+            "name": name,
+            "display_name": _profile_display_name(name),
+            "provider_type": provider_type,
+            "api_key": _env_get(env_values, _profile_env_key(name, "API_KEY")) or "",
+            "base_url": base_url,
+            "models": _split_models(raw_models),
+        }
+    return profiles
+
+
+def _read_api_profile(env_path: Path, profile_name: str | None) -> dict | None:
+    normalized = _normalize_profile_name(profile_name)
+    if not normalized:
+        return None
+    return _list_api_profiles(env_path).get(normalized)
+
+
+def _provider_profile_env_name(prefix: str) -> str:
+    return f"{prefix}_PROVIDER_PROFILE"
+
+
+def _get_provider_env_names(prefix: str, env_values: dict[str, str] | None = None) -> dict[str, tuple[str, ...]]:
+    profile_name = _env_get(env_values or {}, _provider_profile_env_name(prefix))
+    profile_api_key = (_profile_env_key(profile_name, "API_KEY"),) if profile_name else ()
+    profile_base_url = (_profile_env_key(profile_name, "BASE_URL"),) if profile_name else ()
+    profile_provider_type = (_profile_env_key(profile_name, "PROVIDER_TYPE"),) if profile_name else ()
+    profile_models = (
+        _profile_env_key(profile_name, "MODEL_NAMES"),
+        _profile_env_key(profile_name, "MODEL_NAME"),
+    ) if profile_name else ()
+
+    if prefix == "OPENAI":
+        return {
+            "provider_profile": ("OPENAI_PROVIDER_PROFILE",),
+            "provider_type": ("OPENAI_PROVIDER_TYPE", *profile_provider_type),
+            "api_key": ("OPENAI_API_KEY", *profile_api_key),
+            "base_url": ("OPENAI_BASE_URL", *profile_base_url),
+            "models": ("OPENAI_MODEL_NAMES", "MODEL_NAMES", "OPENAI_MODEL_NAME", "MODEL_NAME", *profile_models),
+        }
+    if prefix == "EMBEDDING":
+        provider_type_names = ("EMBEDDING_PROVIDER_TYPE", *profile_provider_type)
+        if not env_values or not _env_get(env_values, "EMBEDDING_BASE_URL"):
+            provider_type_names = ("EMBEDDING_PROVIDER_TYPE", *profile_provider_type, "OPENAI_PROVIDER_TYPE")
+        return {
+            "provider_profile": ("EMBEDDING_PROVIDER_PROFILE",),
+            "provider_type": provider_type_names,
+            "api_key": ("EMBEDDING_API_KEY", *profile_api_key, "OPENAI_API_KEY"),
+            "base_url": ("EMBEDDING_BASE_URL", *profile_base_url, "OPENAI_BASE_URL"),
+            "models": ("EMBEDDING_MODEL_NAMES", "EMBEDDING_MODEL_NAME", *profile_models),
+        }
+    provider_type_names = (f"{prefix}_PROVIDER_TYPE", *profile_provider_type)
+    if not env_values or not _env_get(env_values, f"{prefix}_BASE_URL"):
+        provider_type_names = (f"{prefix}_PROVIDER_TYPE", *profile_provider_type, "OPENAI_PROVIDER_TYPE")
+    return {
+        "provider_profile": (f"{prefix}_PROVIDER_PROFILE",),
+        "provider_type": provider_type_names,
+        "api_key": (f"{prefix}_API_KEY", *profile_api_key, "OPENAI_API_KEY"),
+        "base_url": (f"{prefix}_BASE_URL", *profile_base_url, "OPENAI_BASE_URL"),
+        "models": (
+            f"{prefix}_MODEL_NAMES",
+            f"{prefix}_MODEL_NAME",
+            *profile_models,
+            "OPENAI_MODEL_NAMES",
+            "MODEL_NAMES",
+            "OPENAI_MODEL_NAME",
+            "MODEL_NAME",
+        ),
+    }
+
+
+def _read_provider_config_details(env_path: Path, prefix: str) -> dict:
+    env_values = _read_env_values(env_path)
+    env_names = _get_provider_env_names(prefix, env_values)
+    resolved = {}
+    explicit = {}
+    sources = {}
+
+    for field, names in env_names.items():
+        explicit_value = ""
+        explicit_name = None
+        for name in names:
+            value = _env_get(env_values, name)
+            if value:
+                if explicit_name is None and name.startswith(prefix):
+                    explicit_name = name
+                    explicit_value = value
+                resolved[field] = value
+                sources[field] = name
+                break
+        else:
+            resolved[field] = ""
+            sources[field] = None
+
+        explicit[field] = explicit_value if explicit_name else ""
+
+    base_url = resolved["base_url"] or DEFAULT_OPENAI_BASE_URL
+    provider_type = _normalize_provider_type(resolved.get("provider_type"), base_url)
+    models = _split_models(resolved["models"])
+    explicit_models = _split_models(explicit["models"])
+    provider_profile = _profile_display_name(resolved.get("provider_profile"))
+    explicit_provider_profile = _profile_display_name(explicit.get("provider_profile"))
+    if prefix == "EMBEDDING" and not models:
+        models = [DEFAULT_EMBEDDING_MODEL]
+
+    return {
+        "provider_profile": provider_profile,
+        "provider_type": provider_type,
+        "api_key": resolved["api_key"],
+        "base_url": base_url,
+        "models": models,
+        "explicit_provider_profile": explicit_provider_profile,
+        "explicit_provider_type": explicit["provider_type"],
+        "explicit_api_key": explicit["api_key"],
+        "explicit_base_url": explicit["base_url"],
+        "explicit_models": explicit_models,
+        "sources": sources,
+    }
+
+
+def _render_provider_config_summary(prefix: str, env_path: Path) -> None:
+    details = _read_provider_config_details(env_path, prefix)
+    display_prefix = "GLOBAL DEFAULT" if prefix == "OPENAI" else prefix
+    models_text = _join_models(details["models"]) or "未设置"
+
+    print(f"\n  {BOLD}{CYAN}--- {display_prefix} 当前配置 ---{RESET}")
+    print(f"  PROFILE: {details['provider_profile'] or '未选择'}")
+    print(f"  PROVIDER_TYPE: {details['provider_type']}")
+    print(f"  API_KEY: {_mask_api_key(details['api_key'])}")
+    print(f"  BASE_URL: {details['base_url']}")
+    print(f"  MODEL_NAMES: {models_text}")
+
+    if prefix != "OPENAI":
+        fallback_fields = []
+        if not details["explicit_provider_profile"] and details["sources"].get("provider_profile"):
+            fallback_fields.append("PROFILE")
+        if not details["explicit_provider_type"] and details["sources"].get("provider_type"):
+            fallback_fields.append("PROVIDER_TYPE")
+        if not details["explicit_api_key"] and details["api_key"]:
+            fallback_fields.append("API_KEY")
+        if not details["explicit_base_url"] and details["base_url"]:
+            fallback_fields.append("BASE_URL")
+        if not details["explicit_models"] and details["sources"].get("models") and details["models"]:
+            fallback_fields.append("MODEL_NAMES")
+        if fallback_fields:
+            joined = " / ".join(fallback_fields)
+            print(f"  {DIM}当前部分字段继承自 Global Default：{joined}{RESET}")
+    print()
+
+
+def _render_all_provider_overview(env_path: Path) -> None:
+    print(f"\n  {BOLD}{CYAN}--- Provider Overview ---{RESET}")
+    print(f"  {DIM}先看清当前都配了什么，再决定改哪个。{RESET}\n")
+
+    for _, prefix in PROVIDER_PREFIXES.items():
+        details = _read_provider_config_details(env_path, prefix)
+        label = PROVIDER_LABELS.get(prefix, prefix)
+        key_state = _mask_api_key(details["api_key"])
+        models_text = _join_models(details["models"]) or "未设置"
+        print(f"  {BOLD}{label:<14}{RESET} key={key_state}")
+        print(f"  {DIM}profile:{RESET} {details['provider_profile'] or '未选择'}")
+        print(f"  {DIM}type:{RESET} {details['provider_type']}")
+        print(f"  {DIM}base_url:{RESET} {details['base_url']}")
+        print(f"  {DIM}models:{RESET} {models_text}")
+        if prefix != "OPENAI":
+            inherited = []
+            if not details["explicit_provider_profile"] and details["sources"].get("provider_profile"):
+                inherited.append("PROFILE")
+            if not details["explicit_provider_type"] and details["sources"].get("provider_type"):
+                inherited.append("PROVIDER_TYPE")
+            if not details["explicit_api_key"] and details["api_key"]:
+                inherited.append("API_KEY")
+            if not details["explicit_base_url"] and details["base_url"]:
+                inherited.append("BASE_URL")
+            if not details["explicit_models"] and details["sources"].get("models") and details["models"]:
+                inherited.append("MODEL_NAMES")
+            if inherited:
+                print(f"  {DIM}继承自全局默认:{RESET} {', '.join(inherited)}")
+        print()
+
+
+def _anthropic_api_url(base_url: str, endpoint: str) -> str:
+    base = (base_url or "https://api.anthropic.com/v1").rstrip("/")
+    path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+    if not base.lower().endswith("/v1"):
+        base = f"{base}/v1"
+    return f"{base}{path}"
+
+
+def _list_remote_models(api_key: str, base_url: str, provider_type: str | None = None) -> list[str]:
+    import httpx
+    import json
+
+    provider = _normalize_provider_type(provider_type, base_url)
+    if provider == "anthropic":
+        url = _anthropic_api_url(base_url, "/models")
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "accept": "application/json",
+        }
+    else:
+        url = base_url.rstrip("/") + "/models"
+        headers = {"Authorization": f"Bearer {api_key}"}
+
+    resp = httpx.get(
+        url,
+        headers=headers,
+        timeout=15.0,
+        follow_redirects=True,
+    )
+    resp.raise_for_status()
+    try:
+        payload = resp.json()
+    except json.JSONDecodeError as exc:
+        preview = (resp.text or "").replace("\n", " ").strip()[:120]
+        raise RuntimeError(
+            f"模型列表接口没有返回 JSON。URL={url}，响应预览={preview or '<empty>'}"
+        ) from exc
+
+    models = []
+    data = payload.get("data") or payload.get("models") or payload
+    if isinstance(data, dict):
+        data = data.get("data") or data.get("models") or []
+    if not isinstance(data, list):
+        raise RuntimeError("模型列表响应不是可识别的列表格式。")
+
+    for item in data:
+        if isinstance(item, str):
+            model_id = item
+        elif isinstance(item, dict):
+            model_id = item.get("id") or item.get("name") or item.get("model")
+        else:
+            model_id = getattr(item, "id", None)
+        if model_id:
+            models.append(str(model_id))
+    return sorted(dict.fromkeys(models))
+
+
+def _format_model_list_failure_hint(base_url: str, provider_type: str | None = None) -> str:
+    normalized = (base_url or "").lower()
+    provider = _normalize_provider_type(provider_type, base_url)
+    if provider == "anthropic":
+        return (
+            "你当前选择的是 Anthropic 协议。模型列表会请求 /v1/models；"
+            "如果你使用的是中转站/聚合网关，它可能并不支持 Anthropic models 接口，"
+            "这时可以手动输入 Claude 模型名，或把 PROVIDER_TYPE 改为 openai 并使用该网关的 OpenAI 兼容地址。"
+        )
+    if "generativelanguage.googleapis.com" in normalized and "openai" not in normalized:
+        return (
+            "Gemini 要走 OpenAI 兼容入口时，BASE_URL 通常应类似 "
+            "https://generativelanguage.googleapis.com/v1beta/openai/。"
+        )
+    if "anthropic.com" in normalized:
+        return (
+            "Claude 现在支持 Anthropic 直连适配；BASE_URL 可填 "
+            "https://api.anthropic.com 或 https://api.anthropic.com/v1。"
+            "如果服务端暂时不返回模型列表，手动输入 Claude 模型名也可以继续测试。"
+        )
+    return (
+        "这不要求必须是 OpenAI 官方接口；只要服务提供 /models 或 OpenAI 兼容接口就能自动列出。"
+        "不支持模型列表时，手动输入模型名即可。"
+    )
+
+
+def _choose_models_interactively(models: list[str], default_models: list[str]) -> list[str] | None:
+    if not models:
+        return None
+
+    preview = models[:MODEL_LIST_DISPLAY_LIMIT]
+    choices = preview + [questionary.Separator(), "手动输入模型名", "保留当前设置"]
+    selected = questionary.select(
+        "检测到可用模型，选择一个作为默认模型：",
+        choices=choices,
+        default=default_models[0] if default_models and default_models[0] in preview else None,
+        style=custom_style,
+    ).ask()
+
+    if not selected or selected == "保留当前设置":
+        return None
+    if selected == "手动输入模型名":
+        return []
+    return [selected]
+
+
+def _prompt_model_names(
+    api_key: str,
+    base_url: str,
+    current_models: list[str],
+    current_display: str,
+    provider_type: str = "openai",
+) -> tuple[str | None, list[str] | None]:
+    print(f"    {DIM}模型名可留空保持当前值；输入 {CLEAR_CONFIG_SENTINEL} 可清空显式配置。{RESET}")
+    discover = questionary.confirm(
+        "    是否先尝试从服务端拉取模型列表？",
+        default=bool(api_key),
+        style=custom_style,
+    ).ask()
+
+    if discover and api_key:
+        try:
+            remote_models = _list_remote_models(api_key, base_url, provider_type)
+            if remote_models:
+                print(f"    {GREEN}✓ 已拉取 {len(remote_models)} 个模型。{RESET}")
+                picked = _choose_models_interactively(remote_models, current_models)
+                if picked is None:
+                    return None, None
+                if picked:
+                    return ",".join(picked), picked
+                print(f"    {DIM}未直接选中模型，改为手动输入。{RESET}")
+            else:
+                print(f"    {YELLOW}没有拿到模型列表，改为手动输入。{RESET}")
+        except Exception as exc:
+            print(f"    {YELLOW}无法拉取模型列表：{exc}{RESET}")
+            print(f"    {DIM}{_format_model_list_failure_hint(base_url, provider_type)}{RESET}")
+
+    raw = input(f"    MODEL_NAMES [{current_display or '未设置'}]: ").strip()
+    if not raw:
+        return None, None
+    if raw == CLEAR_CONFIG_SENTINEL:
+        return "", []
+    return raw, _split_models(raw)
+
+
+def _write_provider_field(env_path: Path, key: str, value: str | None) -> None:
+    if value is None:
+        return
+    if value == "":
+        if _env_get(_read_env_values(env_path), key) is not None:
+            unset_key(env_path, key, quote_mode="never")
+        os.environ.pop(key, None)
+        return
+    set_key(env_path, key, value)
+    os.environ[key] = value
+
+
+def _snapshot_provider_env(env_path: Path, prefix: str) -> dict[str, str | None]:
+    env_values = _read_env_values(env_path)
+    keys = [
+        f"{prefix}_PROVIDER_TYPE",
+        f"{prefix}_API_KEY",
+        f"{prefix}_BASE_URL",
+        f"{prefix}_MODEL_NAMES",
+        f"{prefix}_MODEL_NAME",
+    ]
+    return {key: _env_get(env_values, key) for key in keys}
+
+
+def _restore_provider_env_snapshot(env_path: Path, snapshot: dict[str, str | None]) -> None:
+    for key, value in snapshot.items():
+        if value:
+            set_key(env_path, key, value)
+            os.environ[key] = value
+        else:
+            if _env_get(_read_env_values(env_path), key) is not None:
+                unset_key(env_path, key, quote_mode="never")
+            os.environ.pop(key, None)
+
+
+def _render_api_profile_overview(env_path: Path) -> None:
+    profiles = _list_api_profiles(env_path)
+    print(f"\n  {BOLD}{CYAN}--- API Profiles ---{RESET}")
+    if not profiles:
+        print(f"  {DIM}还没有命名档案。可以先添加 deepseek / claude / gemini / ollama 等档案。{RESET}\n")
+        return
+
+    for profile in profiles.values():
+        models_text = _join_models(profile["models"]) or "未设置"
+        print(f"  {BOLD}{profile['display_name']}{RESET} key={_mask_api_key(profile['api_key'])}")
+        print(f"  {DIM}type:{RESET} {profile['provider_type']}")
+        print(f"  {DIM}base_url:{RESET} {profile['base_url'] or '未设置'}")
+        print(f"  {DIM}models:{RESET} {models_text}")
+    print()
+
+
+def _configure_api_profile(env_path: Path, profile_name: str | None = None) -> dict | None:
+    profiles = _list_api_profiles(env_path)
+    if not profile_name:
+        raw_name = input("    档案名（如 deepseek / claude / gemini / ollama）: ").strip()
+        profile_name = raw_name
+
+    normalized = _normalize_profile_name(profile_name)
+    if not normalized:
+        print(f"  {YELLOW}未输入档案名，已取消。{RESET}")
+        return None
+
+    current = profiles.get(normalized, {
+        "provider_type": "openai",
+        "api_key": "",
+        "base_url": DEFAULT_OPENAI_BASE_URL,
+        "models": [],
+    })
+    current_models = current.get("models") or []
+    current_models_text = _join_models(current_models)
+
+    print(f"\n  {BOLD}{CYAN}--- Configuring API Profile: {_profile_display_name(normalized)} ---{RESET}")
+    print(f"  {DIM}直接回车表示保留当前值；输入 {CLEAR_CONFIG_SENTINEL} 可清空字段。{RESET}")
+
+    new_provider_type = input(
+        f"    PROVIDER_TYPE [{current.get('provider_type') or 'openai'}] (openai/anthropic): "
+    ).strip()
+    if new_provider_type == CLEAR_CONFIG_SENTINEL:
+        new_provider_type = ""
+    elif new_provider_type:
+        new_provider_type = _normalize_provider_type(new_provider_type)
+    else:
+        new_provider_type = None
+
+    new_url = input(f"    BASE_URL [{current.get('base_url') or DEFAULT_OPENAI_BASE_URL}]: ").strip()
+    if new_url == CLEAR_CONFIG_SENTINEL:
+        new_url = ""
+    elif not new_url:
+        new_url = None
+
+    new_key = input(f"    API_KEY [{_mask_api_key(current.get('api_key'))}]: ").strip()
+    if new_key == CLEAR_CONFIG_SENTINEL:
+        new_key = ""
+    elif not new_key:
+        new_key = None
+
+    next_api_key = new_key if new_key is not None else current.get("api_key", "")
+    next_base_url = new_url if new_url is not None else (current.get("base_url") or DEFAULT_OPENAI_BASE_URL)
+    next_provider_type = _resolve_provider_type_for_config(
+        new_provider_type,
+        next_base_url,
+        current.get("provider_type", "openai"),
+    )
+    models_raw, _models_list = _prompt_model_names(
+        api_key=next_api_key,
+        base_url=next_base_url,
+        current_models=current_models,
+        current_display=current_models_text,
+        provider_type=next_provider_type,
+    )
+
+    _write_provider_field(env_path, _profile_env_key(normalized, "PROVIDER_TYPE"), new_provider_type)
+    _write_provider_field(env_path, _profile_env_key(normalized, "BASE_URL"), new_url)
+    _write_provider_field(env_path, _profile_env_key(normalized, "API_KEY"), new_key)
+    _write_provider_field(env_path, _profile_env_key(normalized, "MODEL_NAMES"), models_raw)
+    if models_raw is not None:
+        _write_provider_field(env_path, _profile_env_key(normalized, "MODEL_NAME"), "")
+
+    saved = _read_api_profile(env_path, normalized)
+    print(f"\n  {BOLD}{GREEN}✓ API 档案已保存：{_profile_display_name(normalized)}{RESET}\n")
+    return saved
+
+
+def _select_api_profile(env_path: Path, prompt: str = "选择 API 档案：") -> str | None:
+    profiles = _list_api_profiles(env_path)
+    profile_choices = {
+        f"{profile['display_name']} ({profile['provider_type']} / {_join_models(profile['models']) or '未设置模型'})": profile["display_name"]
+        for profile in profiles.values()
+    }
+    choices = list(profile_choices.keys())
+    choices.extend([questionary.Separator(), "➕ 新增 API 档案", "不使用档案（直接配置）", "🔙 返回"])
+
+    selected = questionary.select(prompt, choices=choices, style=custom_style).ask()
+    if not selected or selected.startswith("🔙"):
+        return None
+    if selected == "➕ 新增 API 档案":
+        _configure_api_profile(env_path)
+        return API_PROFILE_HANDLED
+    if selected == "不使用档案（直接配置）":
+        return ""
+    return profile_choices.get(selected)
+
+
+def _assign_profile_to_provider(env_path: Path, prefix: str, profile_name: str) -> dict:
+    normalized = _normalize_profile_name(profile_name)
+    _write_provider_field(env_path, _provider_profile_env_name(prefix), normalized)
+
+    # 选择档案后清理节点旧直填字段，避免旧字段继续覆盖档案内容。
+    for key in (
+        f"{prefix}_PROVIDER_TYPE",
+        f"{prefix}_API_KEY",
+        f"{prefix}_BASE_URL",
+        f"{prefix}_MODEL_NAMES",
+        f"{prefix}_MODEL_NAME",
+    ):
+        _write_provider_field(env_path, key, "")
+
+    cfg = _read_provider_config_from_env_file(env_path, prefix)
+    print(
+        f"\n  {GREEN}✓ {PROVIDER_LABELS.get(prefix, prefix)} 已使用 API 档案："
+        f"{_profile_display_name(normalized)}{RESET}\n"
+    )
+    return cfg
+
+
+def _assign_profile_interactively(env_path: Path, prefix: str) -> dict | None:
+    profile_name = _select_api_profile(
+        env_path,
+        prompt=f"为 {PROVIDER_LABELS.get(prefix, prefix)} 选择 API 档案：",
+    )
+    if profile_name is None:
+        return None
+    if profile_name == API_PROFILE_HANDLED:
+        return None
+    if profile_name == "":
+        _write_provider_field(env_path, _provider_profile_env_name(prefix), "")
+        print(f"\n  {YELLOW}已取消 {PROVIDER_LABELS.get(prefix, prefix)} 的档案绑定，可继续直接配置。{RESET}\n")
+        return _read_provider_config_from_env_file(env_path, prefix)
+    return _assign_profile_to_provider(env_path, prefix, profile_name)
 
 
 def _load_articles_for_filters(limit: int, favorites_only: bool, filters: dict | None) -> list[dict]:
@@ -498,7 +1115,7 @@ def _collect_guided_user_response() -> str | None:
     print("  [4] 这让我想到...")
     print("  [5] 请继续追问我...")
     print("  [Enter] 自由输入  [skip] 跳过")
-    print(f"  {DIM}输入内容后，连续两次回车提交。{RESET}\n")
+    print(f"  {DIM}输入内容后，连续两次空行提交。{RESET}\n")
 
     try:
         choice = input(f"  {GREEN}>{RESET} ").strip().lower()
@@ -510,49 +1127,39 @@ def _collect_guided_user_response() -> str | None:
         return None
 
     starter = starters.get(choice)
-    lines: list[str] = []
-    blank_count = 0
-    first_input = True
+    hint = f"  {DIM}从起手句继续写，连续两次空行提交。输入 skip 跳过。{RESET}\n"
 
-    while True:
-        try:
-            line = input(f"  {GREEN}>{RESET} ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
+    body = collect_multiline(prompt=f"  {GREEN}>{RESET} ", allow_skip=True, hint=hint)
+    if body is None:
+        return None
 
-        if first_input and line.strip().lower() == "skip":
-            return None
+    # 选了起手句编号时，把起手句拼接到正文最前面；自由输入则原样返回
+    if starter:
+        first_line, _, rest = body.partition("\n")
+        # 起手句 + 用户第一行输入；若用户首行为空则只保留起手句
+        joined = f"{starter}{first_line}" if first_line else starter
+        user_response = "\n".join([joined, rest]).strip() if rest else joined
+    else:
+        user_response = body
 
-        if first_input and starter:
-            lines.append(f"{starter}{line.strip()}" if line.strip() else starter)
-            first_input = False
-            continue
-
-        first_input = False
-        if line == "":
-            blank_count += 1
-            if blank_count >= 2:
-                break
-            continue
-
-        blank_count = 0
-        lines.append(line)
-
-    user_response = "\n".join(lines).strip()
     return user_response or None
 
 
 def _process_council_reflection(article: dict, user_response: str):
     """把用户回应接到记忆与 echo 流程里。"""
-    print(f"\n  {DIM}Analyzing your cognitive pattern...{RESET}")
     mem_cfg = get_memory_config()
-    profile = profile_response(
-        user_response=user_response,
-        article_title=article["title"],
-        article_summary=article.get("summary", ""),
-        provider_config=mem_cfg,
-    )
+    with Spinner(
+        "正在整理你的思考痕迹...",
+        style="pulse",
+        success_text="认知画像已提炼",
+        failure_text="认知画像提炼失败",
+    ):
+        profile = profile_response(
+            user_response=user_response,
+            article_title=article["title"],
+            article_summary=article.get("summary", ""),
+            provider_config=mem_cfg,
+        )
 
     print(f"\n  {BOLD}{MAGENTA}[Cognitive Profile]{RESET}")
     print(f"    Preference:  {', '.join(profile.core_preference)}")
@@ -569,31 +1176,44 @@ def _process_council_reflection(article: dict, user_response: str):
     )
     print(f"  {DIM}Memory saved (#{memory_id}){RESET}")
 
-    related = find_related_memories(user_response, exclude_id=memory_id)
     current_tags = {
         "core_preference": profile.core_preference,
         "reasoning_style": profile.reasoning_style,
         "emotional_tone": profile.emotional_tone,
         "stance_summary": profile.stance_summary,
     }
-    echo = generate_echo_report(user_response, current_tags, related, provider_config=mem_cfg)
+    with Spinner(
+        "正在对照历史思维模式...",
+        style="moon",
+        success_text="回声定位完成",
+        failure_text="回声定位失败",
+    ):
+        related = find_related_memories(user_response, exclude_id=memory_id)
+        echo = generate_echo_report(user_response, current_tags, related, provider_config=mem_cfg)
     print(format_echo_report(echo, colors=COLORS))
 
 
 def _run_council_experience(article: dict, pause_at_end: bool = False, paradigm: str = "debate",
                             convergence_protocol: str | None = None):
     """统一 Council 的展示、回应和反馈体验。"""
-    print(f"\n{BOLD}Starting Council discussion for: {article['title']}{RESET}\n")
+    print(f"\n{BOLD}Starting Council discussion for: {article['title']}{RESET}")
+    print(f"{DIM}Council 辩论会进行多轮 LLM 调用，请稍候...{RESET}\n")
 
     cfg = get_council_config()
-    result = run_council(
-        title=article["title"],
-        summary=article.get("summary", ""),
-        content=article.get("summary", ""),
-        provider_config=cfg,
-        paradigm=paradigm,
-        convergence_protocol=convergence_protocol,
-    )
+    # 进度指示器会在每个角色发言前刷新终端行，消除长等待的"卡死"错觉
+    indicator = PhaseIndicator(total=20)
+    try:
+        result = run_council(
+            title=article["title"],
+            summary=article.get("summary", ""),
+            content=article.get("summary", ""),
+            provider_config=cfg,
+            paradigm=paradigm,
+            convergence_protocol=convergence_protocol,
+            on_phase=indicator.advance,
+        )
+    finally:
+        indicator.done()
 
     debate_id = None
     try:
@@ -882,14 +1502,18 @@ def cmd_brief(args):
 - 保留关键信息密度
 """
     
-    print(f"  {DIM}正在生成导读...{RESET}\n")
-    
     cfg = get_council_config()
-    brief_content = chat(
-        system_prompt="你是一个专业的内容精炼师，擅长提取文章核心要点。",
-        user_prompt=brief_prompt,
-        provider_config=cfg,
-    )
+    with Spinner(
+        "正在压缩文章主线...",
+        style="dots",
+        success_text="导读已生成",
+        failure_text="导读生成失败",
+    ):
+        brief_content = chat(
+            system_prompt="你是一个专业的内容精炼师，擅长提取文章核心要点。",
+            user_prompt=brief_prompt,
+            provider_config=cfg,
+        )
     
     print(f"  {MAGENTA}{brief_content}{RESET}\n")
     print(f"  {DIM}{'─' * 56}{RESET}")
@@ -953,69 +1577,109 @@ def cmd_resolve(args):
 
 
 def _configure_provider(env_path: Path, prefix: str):
-    """交互式配置特定的 Provider。"""
-    is_global = (prefix == "OPENAI")
+    """交互式配置特定的 Provider，支持先测后保留、失败后回退。"""
+    is_global = prefix == "OPENAI"
     display_prefix = "GLOBAL DEFAULT" if is_global else prefix
-    
-    current_key = get_key(env_path, f"{prefix}_API_KEY") 
-    current_url = get_key(env_path, f"{prefix}_BASE_URL")
-    current_models = get_key(env_path, f"{prefix}_MODEL_NAMES") or get_key(env_path, f"{prefix}_MODEL_NAME")
-
-    # 如果特定配置为空，显示全局值作为预览
-    if not is_global:
-        if not current_key: current_key = get_key(env_path, "OPENAI_API_KEY") or ""
-        if not current_url: current_url = get_key(env_path, "OPENAI_BASE_URL") or "https://api.openai.com/v1"
-        if not current_models: current_models = get_key(env_path, "MODEL_NAMES") or get_key(env_path, "MODEL_NAME") or "gpt-4o-mini"
-
-    mask_key = f"{current_key[:5]}...{current_key[-3:]}" if len(current_key) > 8 else "***"
+    details = _read_provider_config_details(env_path, prefix)
+    current_models = details["models"]
+    current_models_text = _join_models(current_models)
+    env_snapshot = _snapshot_provider_env(env_path, prefix)
 
     print(f"\n  {BOLD}{CYAN}--- Configuring {display_prefix} ---{RESET}")
-    print(f"  {DIM}(Press Enter to keep current/global values){RESET}\n")
+    print(f"  {DIM}直接回车表示保留当前值；输入 {CLEAR_CONFIG_SENTINEL} 可清空该 Provider 的显式字段。{RESET}")
+    _render_provider_config_summary(prefix, env_path)
 
-    new_key = input(f"    API_KEY [{mask_key}]: ").strip()
-    if new_key:
-        set_key(env_path, f"{prefix}_API_KEY", new_key)
-        os.environ[f"{prefix}_API_KEY"] = new_key
-        current_key = new_key
+    new_provider_type = input(
+        f"    PROVIDER_TYPE [{details['provider_type']}] (openai/anthropic): "
+    ).strip()
+    if new_provider_type == CLEAR_CONFIG_SENTINEL:
+        new_provider_type = ""
+    elif new_provider_type:
+        new_provider_type = _normalize_provider_type(new_provider_type)
+    else:
+        new_provider_type = None
 
-    new_url = input(f"    BASE_URL [{current_url}]: ").strip()
-    if new_url:
-        set_key(env_path, f"{prefix}_BASE_URL", new_url)
-        os.environ[f"{prefix}_BASE_URL"] = new_url
-        current_url = new_url
+    new_url = input(f"    BASE_URL [{details['base_url']}]: ").strip()
+    if new_url == CLEAR_CONFIG_SENTINEL:
+        new_url = ""
+    elif not new_url:
+        new_url = None
 
-    new_models = input(f"    MODEL_NAMES [{current_models}]: ").strip()
-    if new_models:
-        set_key(env_path, f"{prefix}_MODEL_NAMES", new_models)
-        os.environ[f"{prefix}_MODEL_NAMES"] = new_models
-        current_models = new_models
+    new_key = input(f"    API_KEY [{_mask_api_key(details['api_key'])}]: ").strip()
+    if new_key == CLEAR_CONFIG_SENTINEL:
+        new_key = ""
+    elif not new_key:
+        new_key = None
 
-    return _read_provider_config_from_env_file(env_path, prefix)
+    next_api_key = new_key if new_key is not None else (details["explicit_api_key"] or details["api_key"])
+    next_base_url = new_url if new_url is not None else (details["explicit_base_url"] or details["base_url"])
+    next_provider_type = (
+        _resolve_provider_type_for_config(new_provider_type, next_base_url, details["provider_type"])
+        if new_provider_type is not None
+        else _resolve_provider_type_for_config(details["explicit_provider_type"], next_base_url, details["provider_type"])
+    )
+    models_raw, models_list = _prompt_model_names(
+        api_key=next_api_key or details["api_key"],
+        base_url=next_base_url or details["base_url"],
+        current_models=current_models,
+        current_display=current_models_text,
+        provider_type=next_provider_type,
+    )
+
+    _write_provider_field(env_path, f"{prefix}_PROVIDER_TYPE", new_provider_type)
+    _write_provider_field(env_path, f"{prefix}_BASE_URL", new_url)
+    _write_provider_field(env_path, f"{prefix}_API_KEY", new_key)
+    _write_provider_field(env_path, f"{prefix}_MODEL_NAMES", models_raw)
+    if models_raw is not None:
+        _write_provider_field(env_path, f"{prefix}_MODEL_NAME", "")
+
+    updated_cfg = _read_provider_config_from_env_file(env_path, prefix)
+    print(f"\n  {BOLD}{GREEN}✓ Configuration saved!{RESET}\n")
+
+    test_now = questionary.confirm(
+        "是否立即检测这个配置？",
+        default=True,
+        style=custom_style,
+    ).ask()
+    if not test_now:
+        return updated_cfg
+
+    ok = _test_provider_config(prefix, updated_cfg)
+    if ok:
+        return updated_cfg
+
+    action = questionary.select(
+        "检测失败，下一步怎么做？",
+        choices=[
+            "回退到修改前配置（推荐）",
+            "继续保留新配置",
+            "立刻重新编辑",
+        ],
+        style=custom_style,
+    ).ask()
+
+    if action == "继续保留新配置":
+        return updated_cfg
+
+    if action == "立刻重新编辑":
+        _restore_provider_env_snapshot(env_path, env_snapshot)
+        return _configure_provider(env_path, prefix)
+
+    _restore_provider_env_snapshot(env_path, env_snapshot)
+    reverted_cfg = _read_provider_config_from_env_file(env_path, prefix)
+    print(f"\n  {YELLOW}已回退到修改前配置。{RESET}\n")
+    return reverted_cfg
 
 
 def _read_provider_config_from_env_file(env_path: Path, prefix: str) -> dict:
     """从 .env 读取指定 Provider，保持与 src.config 的回退规则一致。"""
-    api_key = get_key(env_path, f"{prefix}_API_KEY")
-    if not api_key and prefix != "OPENAI":
-        api_key = get_key(env_path, "OPENAI_API_KEY")
-
-    base_url = get_key(env_path, f"{prefix}_BASE_URL")
-    if not base_url and prefix != "OPENAI":
-        base_url = get_key(env_path, "OPENAI_BASE_URL") or "https://api.openai.com/v1"
-    elif not base_url:
-        base_url = "https://api.openai.com/v1"
-
-    models_raw = get_key(env_path, f"{prefix}_MODEL_NAMES") or get_key(env_path, f"{prefix}_MODEL_NAME")
-    if not models_raw and prefix == "OPENAI":
-        models_raw = get_key(env_path, "MODEL_NAMES") or get_key(env_path, "MODEL_NAME")
-    if not models_raw and prefix != "OPENAI":
-        models_raw = get_key(env_path, "MODEL_NAMES") or get_key(env_path, "MODEL_NAME")
-
-    models = [m.strip() for m in (models_raw or "").split(",") if m.strip()]
+    details = _read_provider_config_details(env_path, prefix)
     return {
-        "api_key": api_key,
-        "base_url": base_url,
-        "models": models,
+        "provider_profile": details["provider_profile"],
+        "provider_type": details["provider_type"],
+        "api_key": details["api_key"],
+        "base_url": details["base_url"],
+        "models": details["models"],
     }
 
 
@@ -1039,7 +1703,13 @@ def _test_provider_config(prefix: str, provider_config: dict) -> bool:
         return False
 
     if prefix == "EMBEDDING":
-        return _test_embedding_provider_config(display_prefix, api_key, base_url, models)
+        return _test_embedding_provider_config(
+            display_prefix,
+            api_key,
+            base_url,
+            models,
+            provider_config.get("provider_type", "openai"),
+        )
 
     from src.llm.client import chat
 
@@ -1053,6 +1723,7 @@ def _test_provider_config(prefix: str, provider_config: dict) -> bool:
                 model=model,
                 max_retries=1,
                 provider_config={
+                    "provider_type": provider_config.get("provider_type", "openai"),
                     "api_key": api_key,
                     "base_url": base_url,
                     "models": [model],
@@ -1070,9 +1741,43 @@ def _test_provider_config(prefix: str, provider_config: dict) -> bool:
     return ok
 
 
-def _test_embedding_provider_config(display_prefix: str, api_key: str, base_url: str, models: list[str]) -> bool:
+def _test_or_reconfigure_provider(env_path: Path, prefix: str) -> bool:
+    cfg = _read_provider_config_from_env_file(env_path, prefix)
+    ok = _test_provider_config(prefix, cfg)
+    if ok:
+        return True
+
+    reconfigure_now = questionary.confirm(
+        f"{PROVIDER_LABELS.get(prefix, prefix)} 检测失败，现在重新配置？",
+        default=True,
+        style=custom_style,
+    ).ask()
+    if not reconfigure_now:
+        return False
+
+    updated_cfg = _configure_provider(env_path, prefix)
+    return _test_provider_config(prefix, updated_cfg)
+
+
+def _test_embedding_provider_config(
+    display_prefix: str,
+    api_key: str,
+    base_url: str,
+    models: list[str],
+    provider_type: str = "openai",
+) -> bool:
     """检测 Embedding Provider，走 embeddings 接口而不是 chat 接口。"""
     from openai import OpenAI
+
+    if _normalize_provider_type(provider_type, base_url) == "anthropic":
+        print(f"  {RED}✗ Embedding 不能使用 Anthropic 官方 Claude 接口。{RESET}")
+        print(
+            f"  {DIM}请为 EMBEDDING 单独配置 OpenAI 兼容的 embeddings 接口，"
+            f"或清空 EMBEDDING_PROVIDER_TYPE/EMBEDDING_BASE_URL 继承可用的 OpenAI 兼容配置。{RESET}\n"
+        )
+        prefix = "OPENAI" if display_prefix == "GLOBAL DEFAULT" else display_prefix
+        _print_reconfigure_hint(prefix)
+        return False
 
     client = OpenAI(api_key=api_key, base_url=base_url)
     ok = True
@@ -1120,6 +1825,7 @@ def _test_all_provider_configs(env_path: Path) -> dict:
         mode = "embedding" if prefix == "EMBEDDING" else "chat"
         signature = (
             mode,
+            cfg.get("provider_type") or "openai",
             cfg.get("api_key") or "",
             cfg.get("base_url") or "https://api.openai.com/v1",
             tuple(cfg.get("models") or []),
@@ -1199,32 +1905,67 @@ def cmd_config(args):
         _test_provider_config(prefix, cfg)
         return
 
-    print(f"\n{BOLD}{MAGENTA}{'=' * 60}")
-    print(f"  [MindPalace] -- Interactive Configuration")
-    print(f"{'=' * 60}{RESET}")
-    print(f"\n  Which provider would you like to configure?")
-    print(f"  1. {BOLD}Global Default{RESET} (Fallback for all tasks)")
-    print(f"  2. {BOLD}Scout{RESET} (Scoring/Ranking - e.g. DeepSeek)")
-    print(f"  3. {BOLD}Council{RESET} (Persona/Discussion - e.g. Gemini)")
-    print(f"  4. {BOLD}Memory{RESET} (Profiling - defaults to Council)")
-    
-    choice = input(f"\n  Choose [1-4, Default: 1]: ").strip()
-    
-    prefix_map = {
-        "1": "OPENAI",
-        "2": "SCOUT",
-        "3": "COUNCIL",
-        "4": "MEMORY"
-    }
-    
-    prefix = prefix_map.get(choice, "OPENAI")
-    cfg = _configure_provider(env_path, prefix)
+    _interactive_config()
 
-    print(f"\n  {BOLD}{GREEN}✓ Configuration saved securely to .env!{RESET}\n")
 
-    test_now = input("  Test this provider now? [Y/n]: ").strip().lower()
-    if test_now in ("", "y", "yes"):
-        _test_provider_config(prefix, cfg)
+def _check_first_run() -> bool:
+    """检测是否首次运行（API 未配置），并给出引导。
+
+    - 若 ``.env`` 不存在但 ``.env.example`` 存在，自动复制一份。
+    - 若检测到 API Key 或模型未配置，打印友好引导，提示进入「设置」。
+
+    Returns:
+        True 表示已完成配置（非首次）；False 表示需要引导。
+    """
+    env_path = PROJECT_ROOT / ".env"
+    example_path = PROJECT_ROOT / ".env.example"
+
+    if not env_path.exists() and example_path.exists():
+        try:
+            shutil.copy(example_path, env_path)
+            print(f"{DIM}已从 .env.example 创建默认 .env 配置文件。{RESET}")
+        except OSError:
+            pass
+
+    # 重新读取配置（config 模块在 import 时已 load_dotenv，这里直接读 env 文件）
+    env_values = _read_env_values(env_path)
+    api_key = _env_get(env_values, "OPENAI_API_KEY")
+    models_raw = (
+        _env_get(env_values, "OPENAI_MODEL_NAMES")
+        or _env_get(env_values, "MODEL_NAMES")
+        or _env_get(env_values, "OPENAI_MODEL_NAME")
+        or _env_get(env_values, "MODEL_NAME")
+    )
+
+    has_key = bool(api_key and not api_key.startswith("sk-your"))
+    has_models = bool(models_raw)
+
+    if not has_key or not has_models:
+        print(f"{YELLOW}⚠️  检测到 API 尚未配置。{RESET}")
+        print(f"{DIM}完整功能需要 OpenAI 兼容 API。"
+              f"请在主菜单选择「⚙️ 设置 → 配置 API / 模型」完成首次配置。{RESET}")
+        print(f"{DIM}参考 .env.example 了解支持的 Provider（OpenAI / DeepSeek / 本地 Ollama 等）。{RESET}\n")
+        return False
+    return True
+
+
+def _check_first_run_silent() -> bool:
+    """静默版本的配置检测，仅返回布尔值，不打印引导。
+
+    用于菜单循环中在「设置」完成后刷新提示标签。
+    """
+    env_path = PROJECT_ROOT / ".env"
+    env_values = _read_env_values(env_path)
+    api_key = _env_get(env_values, "OPENAI_API_KEY")
+    models_raw = (
+        _env_get(env_values, "OPENAI_MODEL_NAMES")
+        or _env_get(env_values, "MODEL_NAMES")
+        or _env_get(env_values, "OPENAI_MODEL_NAME")
+        or _env_get(env_values, "MODEL_NAME")
+    )
+    has_key = bool(api_key and not api_key.startswith("sk-your"))
+    has_models = bool(models_raw)
+    return has_key and has_models
 
 
 def interactive_menu():
@@ -1239,16 +1980,21 @@ def interactive_menu():
     print(f"{RESET}")
     print(f"  {DIM}你的私人认知进化实验室{RESET}\n")
 
+    configured = _check_first_run()
+
     while True:
+        # 未配置时在菜单项上追加提示，引导首次用户
+        practice_label = "🚀 今日练习" + ("" if configured else "  (需先配置 API)")
+        settings_label = "⚙️  设置" + ("" if configured else "  (首次使用)")
         action = questionary.select(
             "请选择功能：",
             choices=[
-                "🚀 今日练习",
+                practice_label,
                 "📚 文章库",
                 "🧭 心智漫游",
                 "💬 深度对话",
                 "🧠 认知回顾",
-                "⚙️  设置",
+                settings_label,
                 questionary.Separator(),
                 "❌ 退出"
             ],
@@ -1272,6 +2018,8 @@ def interactive_menu():
                 _interactive_cognition()
             elif action.startswith("⚙️"):
                 _interactive_config()
+                # 配置可能刚刚完成，重新检测以更新菜单提示标签
+                configured = _check_first_run_silent()
         except KeyboardInterrupt:
             print(f"\n{DIM}操作已取消{RESET}\n")
             continue
@@ -1696,8 +2444,6 @@ def _interactive_list(favorites_only: bool = False, filters: dict | None = None)
 
 def _show_brief(article):
     """显示文章导读。"""
-    print(f"\n{DIM}正在生成导读...{RESET}\n")
-    
     from src.llm.client import chat
     
     brief_prompt = f"""请为以下文章生成一份导读精炼版，帮助读者快速理解核心内容。
@@ -1720,11 +2466,17 @@ def _show_brief(article):
     
     try:
         cfg = get_council_config()
-        brief_content = chat(
-            system_prompt="你是一个专业的内容精炼师，擅长提取文章核心要点。",
-            user_prompt=brief_prompt,
-            provider_config=cfg,
-        )
+        with Spinner(
+            "正在压缩文章主线...",
+            style="dots",
+            success_text="导读已生成",
+            failure_text="导读生成失败",
+        ):
+            brief_content = chat(
+                system_prompt="你是一个专业的内容精炼师，擅长提取文章核心要点。",
+                user_prompt=brief_prompt,
+                provider_config=cfg,
+            )
         
         print(f"{BOLD}{MAGENTA}[导读精炼版]{RESET}\n")
         print(f"{brief_content}\n")
@@ -1753,12 +2505,17 @@ def _open_in_browser(article):
         print(f"\n{RED}文章链接不存在。{RESET}\n")
         return
     
-    print(f"\n{DIM}正在打开浏览器...{RESET}")
     print(f"{CYAN}{url}{RESET}\n")
     
     try:
-        webbrowser.open(url)
-        print(f"{GREEN}✓ 已在浏览器中打开原文{RESET}\n")
+        with Spinner(
+            "正在唤起浏览器...",
+            style="pulse",
+            success_text="已在浏览器中打开原文",
+            failure_text="浏览器打开失败",
+        ):
+            webbrowser.open(url)
+        print()
     except Exception as e:
         print(f"{RED}无法打开浏览器: {e}{RESET}\n")
         print(f"请手动访问: {url}\n")
@@ -1893,10 +2650,11 @@ def _interactive_resolve():
             print(f"\n{YELLOW}暂无历史会话。{RESET}\n")
             return
         
-        choices = [
-            f"[{s['id'][:8]}...] {s['title']} ({s['mode']}) - {s['updated_at'][:10]}"
+        session_choices = {
+            f"[{s['id'][:8]}...] {s['title']} ({s['mode']}) - {s['updated_at'][:10]}": s["id"]
             for s in sessions
-        ]
+        }
+        choices = list(session_choices.keys())
         choices.append(questionary.Separator())
         choices.append("🔙 返回")
         
@@ -1907,7 +2665,9 @@ def _interactive_resolve():
         ).ask()
         
         if selected and not selected.startswith("🔙"):
-            session_id = selected.split("]")[0].strip("[")
+            session_id = session_choices.get(selected)
+            if not session_id:
+                return
             run_repl(session_id=session_id)
 
 
@@ -1928,8 +2688,13 @@ def _interactive_eval():
         print(f"{RED}请输入有效数字{RESET}")
         return
 
-    print(f"\n  {DIM}正在评估最近 {days} 天的讨论...{RESET}")
-    reports = judge_recent_debates(days=days)
+    with Spinner(
+        f"正在评估最近 {days} 天的讨论...",
+        style="bar",
+        success_text="讨论评估完成",
+        failure_text="讨论评估失败",
+    ):
+        reports = judge_recent_debates(days=days)
     if not reports:
         print(f"  {YELLOW}该时间段内没有讨论记录。{RESET}\n")
         return
@@ -1946,8 +2711,13 @@ def _interactive_eval():
     ).ask()
     if do_iterate:
         from src.eval.prompt_iterator import generate_iteration_suggestions
-        print(f"\n  {DIM}正在生成...{RESET}")
-        suggestions = generate_iteration_suggestions(days=days)
+        with Spinner(
+            "正在生成 Prompt 改进建议...",
+            style="moon",
+            success_text="Prompt 建议已生成",
+            failure_text="Prompt 建议生成失败",
+        ):
+            suggestions = generate_iteration_suggestions(days=days)
         print(f"\n{suggestions}\n")
 
 
@@ -2027,7 +2797,9 @@ def _interactive_config():
     action = questionary.select(
         "设置：",
         choices=[
-            "🔧 配置 API / 模型",
+            "📚 管理 API 档案",
+            "🔗 为节点选择 API 档案",
+            "🔧 高级：逐节点直接配置",
             "🧪 检测 API 是否可用",
             questionary.Separator(),
             "🔙 返回主菜单",
@@ -2038,38 +2810,36 @@ def _interactive_config():
     if not action or action.startswith("🔙"):
         return
 
+    if action.startswith("📚"):
+        _render_api_profile_overview(env_path)
+        selected = _select_api_profile(env_path, prompt="选择要编辑的 API 档案：")
+        if selected is None:
+            return
+        if selected == API_PROFILE_HANDLED:
+            return
+        if selected == "":
+            _configure_provider(env_path, "OPENAI")
+            return
+        _configure_api_profile(env_path, selected)
+        return
+
+    _render_all_provider_overview(env_path)
     provider = _select_provider_for_config(allow_all=action.startswith("🧪"))
     if not provider:
         return
 
-    if action.startswith("🔧"):
-        cfg = _configure_provider(env_path, provider)
-        print(f"\n  {BOLD}{GREEN}✓ Configuration saved!{RESET}\n")
-        test_now = questionary.confirm(
-            "是否立即检测这个配置？",
-            default=True,
-            style=custom_style,
-        ).ask()
-        if test_now:
-            _test_provider_config(provider, cfg)
+    if action.startswith("🔗"):
+        _render_api_profile_overview(env_path)
+        _assign_profile_interactively(env_path, provider)
+    elif action.startswith("🔧"):
+        _configure_provider(env_path, provider)
     elif action.startswith("🧪"):
         if provider == "ALL":
             result = _test_all_provider_configs(env_path)
             if not result["all_ok"]:
                 _prompt_reconfigure_failed_provider(env_path, result["failed_prefixes"])
         else:
-            cfg = _read_provider_config_from_env_file(env_path, provider)
-            ok = _test_provider_config(provider, cfg)
-            if not ok:
-                reconfigure_now = questionary.confirm(
-                    f"{PROVIDER_LABELS.get(provider, provider)} 检测失败，现在重新配置？",
-                    default=True,
-                    style=custom_style,
-                ).ask()
-                if reconfigure_now:
-                    updated_cfg = _configure_provider(env_path, provider)
-                    print(f"\n  {BOLD}{GREEN}✓ Configuration saved!{RESET}\n")
-                    _test_provider_config(provider, updated_cfg)
+            _test_or_reconfigure_provider(env_path, provider)
 
 
 def _select_provider_for_config(allow_all: bool = False) -> str | None:
@@ -2129,9 +2899,7 @@ def _prompt_reconfigure_failed_provider(env_path: Path, failed_prefixes: list[st
 
     label_to_prefix = {PROVIDER_LABELS.get(prefix, prefix): prefix for prefix in failed_prefixes}
     prefix = label_to_prefix[selected]
-    updated_cfg = _configure_provider(env_path, prefix)
-    print(f"\n  {BOLD}{GREEN}✓ Configuration saved!{RESET}\n")
-    _test_provider_config(prefix, updated_cfg)
+    _configure_provider(env_path, prefix)
 
 
 def main():
