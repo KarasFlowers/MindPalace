@@ -11,6 +11,7 @@ from src.memory.echo import format_echo_report, generate_echo_report
 from src.memory.profiler import CognitiveProfile, profile_response
 from src.memory.store import find_related_memories, save_memory
 from src.config import get_memory_config
+from src.ux import Spinner, collect_multiline
 
 logger = logging.getLogger(__name__)
 
@@ -42,22 +43,12 @@ def format_card(card: PromptCard) -> str:
 
 
 def collect_multiline_response() -> str | None:
-    """收集多行回答；Enter 两次提交，skip 跳过。"""
-    print(f"{DIM}请写下第一反应。按 Enter 两次提交，输入 skip 跳过。{RESET}\n")
-    lines: list[str] = []
-    while True:
-        try:
-            line = input(f"{GREEN}>{RESET} ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return None
-        if line.strip().lower() == "skip":
-            return None
-        if line == "" and lines and lines[-1] == "":
-            break
-        lines.append(line)
-    response = "\n".join(lines).strip()
-    return response or None
+    """收集多行回答；连续两次空行提交，skip 跳过。
+
+    复用统一的 src.ux.collect_multiline，保持与 council / daily 一致的交互规则。
+    """
+    hint = f"{DIM}请写下第一反应。连续两次空行提交，输入 skip 跳过。{RESET}\n"
+    return collect_multiline(prompt=f"{GREEN}>{RESET} ", allow_skip=True, hint=hint)
 
 
 def print_analysis(analysis: dict) -> None:
@@ -154,8 +145,13 @@ def run_inquiry_session(kind: str | None = None, card: PromptCard | None = None)
         print(f"\n{DIM}已跳过。{RESET}\n")
         return None
 
-    print(f"\n{DIM}正在提炼你的回答...{RESET}")
-    analysis = analyze_response(selected, user_response)
+    with Spinner(
+        "正在提炼你的回答...",
+        style="pulse",
+        success_text="回答提炼完成",
+        failure_text="回答提炼失败",
+    ):
+        analysis = analyze_response(selected, user_response)
     print_analysis(analysis)
 
     try:

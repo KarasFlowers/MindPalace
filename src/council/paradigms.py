@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from typing import Callable
 
 from src.config import CONVERGE_THRESHOLD, MAX_REBUTTAL_ROUNDS
 from src.council.judge import finalize as judge_finalize
@@ -21,6 +22,14 @@ from src.council.state import DebateState, Phase, Turn
 from src.obs import span
 
 logger = logging.getLogger(__name__)
+
+# 进度回调类型（与 src.council.flow.PhaseCallback 一致）
+PhaseCallback = Callable[[str], None]
+
+
+def _noop_phase(_label: str) -> None:
+    """默认无操作的进度回调。"""
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -38,12 +47,18 @@ class DiscussionParadigm(ABC):
     name: str = "base"
 
     @abstractmethod
-    def run_discussion(self, state: DebateState, council_cfg: dict) -> DebateState:
+    def run_discussion(
+        self,
+        state: DebateState,
+        council_cfg: dict,
+        on_phase: PhaseCallback | None = None,
+    ) -> DebateState:
         """执行讨论流程（opening + 可选 rebuttal），不调用 judge finalize。
 
         Args:
             state: 已完成 routing 的 DebateState（含 difficulty / active_roles）。
             council_cfg: Council 档 provider 配置。
+            on_phase: 进度回调，在每个角色发言前被调用，传入阶段描述。
 
         Returns:
             更新后的 state（含 turns，phase 推进到 JUDGING 之前）。
@@ -151,10 +166,20 @@ class DebateParadigm(DiscussionParadigm):
 
     name = "debate"
 
-    def run_discussion(self, state: DebateState, council_cfg: dict) -> DebateState:
+    def run_discussion(
+        self,
+        state: DebateState,
+        council_cfg: dict,
+        on_phase: PhaseCallback | None = None,
+    ) -> DebateState:
+        report_phase = on_phase or _noop_phase
+
         # --- Phase 1: Opening ---
         state.phase = Phase.OPENING
-        for role_key in state.active_roles:
+        n_roles = len(state.active_roles)
+        for i, role_key in enumerate(state.active_roles, 1):
+            role_name = get_role(role_key)["name"]
+            report_phase(f"[{i}/{n_roles}] {role_name} 正在首轮陈述...")
             content_json, tc_used, tc_log = self._run_role_turn(
                 state, role_key, council_cfg, Phase.OPENING, force_closing=False
             )
@@ -171,6 +196,11 @@ class DebateParadigm(DiscussionParadigm):
                 force_closing = state.round_idx == state.max_rebuttal_rounds
 
                 for role_key in state.active_roles:
+                    role_name = get_role(role_key)["name"]
+                    round_label = (
+                        "强制落地" if force_closing else f"第 {state.round_idx} 轮反驳"
+                    )
+                    report_phase(f"[{round_label}] {role_name} 正在反驳...")
                     content_json, tc_used, tc_log = self._run_role_turn(
                         state, role_key, council_cfg, Phase.REBUTTAL,
                         force_closing=force_closing,
@@ -185,6 +215,7 @@ class DebateParadigm(DiscussionParadigm):
                     break
 
                 # 收敛检查：通过可插拔协议（默认 midcheck，向后兼容）
+                report_phase("Judge 正在评估分歧度...")
                 from src.council.protocol_registry import get_protocol
                 protocol = get_protocol(state.convergence_protocol)
                 result = protocol.check(state, council_cfg)
@@ -218,7 +249,14 @@ class ReportParadigm(DiscussionParadigm):
 
     name = "report"
 
-    def run_discussion(self, state: DebateState, council_cfg: dict) -> DebateState:
+    def run_discussion(
+        self,
+        state: DebateState,
+        council_cfg: dict,
+        on_phase: PhaseCallback | None = None,
+    ) -> DebateState:
+        report_phase = on_phase or _noop_phase
+
         if not state.active_roles:
             state.terminated_by = "no_rebuttal"
             return state
@@ -229,6 +267,7 @@ class ReportParadigm(DiscussionParadigm):
 
         # --- Phase 1: 主起草人生成报告（opening）---
         state.phase = Phase.OPENING
+        report_phase(f"{get_role(drafter)['name']} 正在起草报告...")
         content_json, tc_used, tc_log = self._run_role_turn(
             state, drafter, council_cfg, Phase.OPENING, force_closing=False
         )
@@ -241,7 +280,10 @@ class ReportParadigm(DiscussionParadigm):
         if reviewers and state.max_rebuttal_rounds > 0:
             state.phase = Phase.REBUTTAL
             state.round_idx = 1
-            for role_key in reviewers:
+            n_reviewers = len(reviewers)
+            for i, role_key in enumerate(reviewers, 1):
+                role_name = get_role(role_key)["name"]
+                report_phase(f"[{i}/{n_reviewers}] {role_name} 正在审阅...")
                 content_json, tc_used, tc_log = self._run_role_turn(
                     state, role_key, council_cfg, Phase.REBUTTAL,
                     force_closing=False,

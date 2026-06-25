@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Callable
 
 from src.config import (
     CONVERGE_THRESHOLD,
@@ -36,6 +37,14 @@ from src.llm.client import chat_json, chat_with_tools  # noqa: F401  re-exported
 from src.obs import span
 
 logger = logging.getLogger(__name__)
+
+# 进度回调类型：接收一个阶段描述字符串，由调用方决定如何展示（如行内刷新）。
+PhaseCallback = Callable[[str], None]
+
+
+def _noop_phase(_label: str) -> None:
+    """默认无操作的进度回调，避免调用处判空。"""
+    return None
 
 
 # 向后兼容：旧代码 `from src.council.flow import CouncilResult` 仍可工作
@@ -53,6 +62,7 @@ def run_council(
     converge_threshold: float | None = None,
     paradigm: str = "debate",
     convergence_protocol: str | None = None,
+    on_phase: PhaseCallback | None = None,
 ) -> DebateState:
     """运行一次完整的议事厅辩论。
 
@@ -69,11 +79,17 @@ def run_council(
         convergence_protocol: 收敛协议（midcheck / consensus_threshold / voting）。
             None 时从 .env COUNCIL_CONVERGENCE_PROTOCOL 读取（默认 midcheck）。
             借鉴 MALLM 的 decision_protocols，通过 protocol_registry.py 注册。
+        on_phase: 进度回调，在路由 / 各角色发言 / Judge 收敛等关键节点被调用，
+            传入一段中文阶段描述（如 "评估话题难度..."）。传 None 时无进度反馈，
+            保持向后兼容。调用方负责决定如何展示（典型实现见 src.ux.progress）。
 
     Returns:
         DebateState：包含完整辩论过程与 Judge 共识结果。
     """
     logger.info("=== Council Session Start [paradigm=%s]: %s ===", paradigm, title[:50])
+
+    # 归一化回调：None → no-op，避免每个调用点都判空
+    report_phase = on_phase or _noop_phase
 
     _debate_span = span("council.debate", article_title=title[:80], paradigm=paradigm)
     _s = _debate_span.__enter__()
@@ -95,6 +111,7 @@ def run_council(
         council_cfg = provider_config or get_council_config()
 
         # --- Phase 0: Routing ---
+        report_phase("评估话题难度...")
         difficulty, active_roles, reasoning = route_difficulty(title, summary)
         state.difficulty = difficulty
         state.active_roles = active_roles
@@ -103,9 +120,10 @@ def run_council(
         # --- Phases 1-2: 范式驱动讨论（opening + 可选 rebuttal）---
         paradigm_cls = get_paradigm(paradigm)
         paradigm_inst = paradigm_cls()
-        paradigm_inst.run_discussion(state, council_cfg)
+        paradigm_inst.run_discussion(state, council_cfg, on_phase=report_phase)
 
         # --- Phase 3: Judge finalize ---
+        report_phase("Judge 正在收敛共识...")
         state.phase = Phase.JUDGING
         state.consensus = judge_finalize(state)
         state.phase = Phase.DONE
