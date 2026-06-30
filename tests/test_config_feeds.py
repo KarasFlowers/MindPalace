@@ -42,6 +42,28 @@ class TestScoutFeedConfig:
             assert config.get_default_feeds() == config.FEED_PRESETS["tech"]
         _reload_config()
 
+    def test_chinese_presets_are_available(self):
+        config = _reload_config()
+
+        assert "humanities_zh" in config.FEED_PRESETS
+        assert "mixed_zh" in config.FEED_PRESETS
+        assert config.get_default_feeds("humanities_zh") == config.FEED_PRESETS["humanities_zh"]
+        assert config.get_default_feeds("mixed_zh") == config.FEED_PRESETS["mixed_zh"]
+        _reload_config()
+
+    def test_scout_translate_defaults_to_enabled(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SCOUT_TRANSLATE", None)
+            config = _reload_config()
+            assert config.SCOUT_TRANSLATE is True
+        _reload_config()
+
+    def test_scout_translate_can_be_disabled(self):
+        with patch.dict(os.environ, {"SCOUT_TRANSLATE": "false"}, clear=False):
+            config = _reload_config()
+            assert config.SCOUT_TRANSLATE is False
+        _reload_config()
+
     def test_custom_feed_list_overrides_env_preset(self):
         with patch.dict(
             os.environ,

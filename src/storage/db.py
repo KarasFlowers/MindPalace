@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS articles (
     source        TEXT NOT NULL,
     summary       TEXT,
     clean_content TEXT,
+    source_lang   TEXT,
+    translated    INTEGER NOT NULL DEFAULT 0,
     scores_json   TEXT,
     total_score   REAL,
     reasoning     TEXT,
@@ -40,6 +42,8 @@ CREATE TABLE IF NOT EXISTS article_tags (
 
 _ARTICLE_MIGRATION_COLUMNS = [
     ("clean_content", "TEXT"),
+    ("source_lang", "TEXT"),
+    ("translated", "INTEGER NOT NULL DEFAULT 0"),
     ("is_favorite", "INTEGER NOT NULL DEFAULT 0"),
     ("favorited_at", "TEXT"),
     ("favorite_note", "TEXT"),
@@ -190,6 +194,7 @@ def _row_to_article_dict(row) -> dict:
     d = dict(row)
     d["scores"] = json.loads(d.pop("scores_json", "{}"))
     d["is_favorite"] = bool(d.get("is_favorite", 0))
+    d["translated"] = bool(d.get("translated", 0))
     d["tags"] = []
     return d
 
@@ -274,8 +279,9 @@ def save_articles(articles) -> None:
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO articles
-                    (url, title, source, summary, clean_content, scores_json, total_score, reasoning, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (url, title, source, summary, clean_content, source_lang, translated,
+                     scores_json, total_score, reasoning, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         a.url,
@@ -283,6 +289,8 @@ def save_articles(articles) -> None:
                         a.source,
                         a.summary,
                         a.clean_content,
+                        getattr(a, "source_lang", None),
+                        1 if getattr(a, "translated", False) else 0,
                         json.dumps(a.scores, ensure_ascii=False),
                         a.total_score,
                         a.reasoning,

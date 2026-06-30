@@ -156,6 +156,21 @@ FEED_PRESETS = {
         "https://hnrss.org/best",
         "http://arxiv.org/rss/cs.AI",
     ],
+    "humanities_zh": [
+        "https://plink.anyfeeder.com/infzm/recommends",
+        "https://plink.anyfeeder.com/weixin/ibookreview",
+        "https://plink.anyfeeder.com/weixin/dandureading",
+        "https://plink.anyfeeder.com/weixin/The-Intellectual",
+        "https://plink.anyfeeder.com/weixin/gjrwls",
+    ],
+    "mixed_zh": [
+        "https://plink.anyfeeder.com/infzm/recommends",
+        "https://plink.anyfeeder.com/thepaper",
+        "https://plink.anyfeeder.com/sspai",
+        "https://plink.anyfeeder.com/weixin/Guokr42",
+        "https://hnrss.org/best",
+        "http://arxiv.org/rss/cs.AI",
+    ],
     "tech": [
         "https://hnrss.org/best",
         "http://arxiv.org/rss/cs.AI",
@@ -186,6 +201,7 @@ def get_default_feeds(preset: str | None = None) -> list[str]:
 DEFAULT_FEEDS = get_default_feeds()
 SCOUT_TOP_K = 5
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+SCOUT_TRANSLATE = os.getenv("SCOUT_TRANSLATE", "true").lower() in {"1", "true", "yes", "on"}
 ARTICLE_RETENTION_DAYS = int(os.getenv("ARTICLE_RETENTION_DAYS", "30"))
 ARTICLE_AUTO_CLEANUP = os.getenv("ARTICLE_AUTO_CLEANUP", "true").lower() in {"1", "true", "yes", "on"}
 
