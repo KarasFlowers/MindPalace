@@ -115,6 +115,34 @@ class TestScoreArticle:
         assert result.scores["causal_chain"] == 7
         assert result.summary == "一篇关于测试的文章"
         assert result.total_score > 0
+        assert result.source_lang == "unknown"
+        assert result.translated is False
+
+    @patch("src.scout.score.chat_json")
+    def test_carries_translation_metadata(self, mock_chat_json):
+        mock_chat_json.return_value = {
+            "information_density": 8,
+            "principle_depth": 9,
+            "causal_chain": 7,
+            "summary": "一篇关于测试的文章",
+            "reasoning": "逻辑清晰，原理深入",
+        }
+
+        article = NormalizedArticle(
+            url="https://example.com/1",
+            title="Test",
+            content="raw content",
+            clean_content="clean content",
+            source="Test Source",
+            published_at="2026-01-01",
+        )
+        article.source_lang = "other"
+        article.translated = True
+
+        result = score_article(article)
+
+        assert result.source_lang == "other"
+        assert result.translated is True
 
     @patch("src.scout.score.chat_json")
     def test_sorting_by_total_score(self, mock_chat_json):
@@ -157,3 +185,27 @@ class TestScoreArticle:
         assert results[0].summary == "高分文章"
         assert results[1].summary == "低分文章"
         assert results[0].total_score > results[1].total_score
+
+
+class TestPipelineTranslation:
+    @patch("src.scout.pipeline.score_all", return_value=[])
+    @patch("src.scout.pipeline.maybe_translate_article")
+    def test_translate_all_updates_content_before_scoring(self, mock_translate, mock_score_all):
+        from src.scout.pipeline import translate_all
+
+        article = NormalizedArticle(
+            url="https://example.com/1",
+            title="Test",
+            content="raw",
+            clean_content="English content",
+            source="Test",
+            published_at="2026-01-01",
+        )
+        mock_translate.return_value = ("other", "中文内容", True)
+
+        translated = translate_all([article], provider_config={"models": ["m"]})
+
+        assert translated[0].clean_content == "中文内容"
+        assert translated[0].source_lang == "other"
+        assert translated[0].translated is True
+        mock_score_all.assert_not_called()

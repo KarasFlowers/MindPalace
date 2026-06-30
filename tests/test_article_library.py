@@ -15,6 +15,8 @@ def _article(url: str, title: str, source: str = "Test Source", score: float = 8
         source=source,
         summary="summary",
         clean_content="content",
+        source_lang="zh",
+        translated=False,
         scores={"information_density": 8, "principle_depth": 8, "causal_chain": 8},
         total_score=score,
         reasoning="reasoning",
@@ -101,7 +103,7 @@ class TestArticleLibrary:
             }
         assert "article_tags" in tables
 
-    def test_legacy_articles_table_gets_clean_content_column_migrated(self):
+    def test_legacy_articles_table_gets_article_columns_migrated_idempotently(self):
         from src.storage.db import _get_conn, init_db
 
         conn = sqlite3.connect(self._tmp.name)
@@ -124,6 +126,7 @@ class TestArticleLibrary:
         conn.close()
 
         init_db()
+        init_db()
 
         with _get_conn() as conn2:
             cols = {
@@ -131,6 +134,21 @@ class TestArticleLibrary:
                 for row in conn2.execute("PRAGMA table_info(articles)").fetchall()
             }
         assert "clean_content" in cols
+        assert "source_lang" in cols
+        assert "translated" in cols
+
+    def test_save_articles_persists_translation_metadata(self):
+        from src.storage.db import list_articles, save_articles
+
+        article = _article("https://example.com/translated", "Translated")
+        article.source_lang = "other"
+        article.translated = True
+
+        save_articles([article])
+
+        saved = list_articles()[0]
+        assert saved["source_lang"] == "other"
+        assert saved["translated"] is True
 
     def test_favorite_article_is_listed_and_protected_from_cleanup(self):
         from src.storage.db import (

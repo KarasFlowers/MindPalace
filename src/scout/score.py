@@ -60,6 +60,8 @@ class ScoredArticle:
     scores: dict[str, int]  # {"information_density": x, "principle_depth": y, "causal_chain": z}
     total_score: float
     reasoning: str
+    source_lang: str = "unknown"
+    translated: bool = False
 
 
 def _compute_total(scores: dict[str, int]) -> float:
@@ -99,6 +101,8 @@ def score_article(
         scores=scores,
         total_score=_compute_total(scores),
         reasoning=result.get("reasoning", ""),
+        source_lang=getattr(article, "source_lang", "unknown"),
+        translated=bool(getattr(article, "translated", False)),
     )
 
 

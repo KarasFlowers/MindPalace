@@ -539,6 +539,40 @@ def test_interactive_profile_create_does_not_reopen_editor(tmp_path):
     mock_configure.assert_not_called()
 
 
+def test_interactive_config_opens_scout_source_settings(tmp_path):
+    from src import app
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+
+    with patch.object(app, "PROJECT_ROOT", tmp_path), \
+         patch("src.app.questionary.select") as mock_select, \
+         patch("src.app._configure_scout_sources") as mock_sources:
+        mock_select.return_value.ask.return_value = "📰 信息源设置"
+        app._interactive_config()
+
+    mock_sources.assert_called_once_with(env_path)
+
+
+def test_configure_scout_sources_selects_preset_and_clears_custom_feeds(tmp_path):
+    from src import app
+
+    env_path = tmp_path / ".env"
+    env_path.write_text("SCOUT_FEEDS=https://example.com/rss.xml\n", encoding="utf-8")
+    answers = iter([
+        "📚 选择内置信息源 preset",
+        "humanities_zh",
+        "🔙 返回设置",
+    ])
+
+    with patch("src.app.questionary.select") as mock_select:
+        mock_select.return_value.ask.side_effect = lambda: next(answers)
+        app._configure_scout_sources(env_path)
+
+    assert app.get_key(env_path, "SCOUT_FEED_PRESET") == "humanities_zh"
+    assert app.get_key(env_path, "SCOUT_FEEDS") is None
+
+
 def test_select_api_profile_returns_profile_from_choice_mapping(tmp_path):
     from src import app
 

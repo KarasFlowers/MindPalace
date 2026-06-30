@@ -71,6 +71,7 @@ from src.config import (
     ARTICLE_RETENTION_DAYS,
     FEED_PRESETS,
     PROJECT_ROOT,
+    SCOUT_TRANSLATE,
     get_default_feeds,
     get_scout_config,
     get_council_config,
@@ -677,6 +678,87 @@ def _write_provider_field(env_path: Path, key: str, value: str | None) -> None:
         return
     set_key(env_path, key, value)
     os.environ[key] = value
+
+
+def _parse_env_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _format_scout_source_status(env_path: Path) -> str:
+    env_values = _read_env_values(env_path)
+    custom_feeds = _env_get(env_values, "SCOUT_FEEDS") or _env_get(env_values, "FEEDS")
+    preset = _env_get(env_values, "SCOUT_FEED_PRESET") or "humanities"
+    translate_on = _parse_env_bool(_env_get(env_values, "SCOUT_TRANSLATE"), SCOUT_TRANSLATE)
+    source = "自定义 RSS" if custom_feeds else f"preset={preset}"
+    translate = "开启" if translate_on else "关闭"
+    return f"{source} | 非中文翻译：{translate}"
+
+
+def _configure_scout_sources(env_path: Path) -> None:
+    """配置 Scout 信息源和翻译开关。"""
+    while True:
+        action = questionary.select(
+            f"信息源设置（当前：{_format_scout_source_status(env_path)}）：",
+            choices=[
+                "📚 选择内置信息源 preset",
+                "🔗 设置自定义 RSS 列表",
+                "🌐 设置非中文文章自动翻译",
+                questionary.Separator(),
+                "🔙 返回设置",
+            ],
+            style=custom_style,
+        ).ask()
+
+        if not action or action.startswith("🔙"):
+            return
+
+        if action.startswith("📚"):
+            current = _env_get(_read_env_values(env_path), "SCOUT_FEED_PRESET") or "humanities"
+            selected = questionary.select(
+                "选择 Scout 信息源 preset：",
+                choices=[*sorted(FEED_PRESETS.keys()), questionary.Separator(), "🔙 返回"],
+                default=current if current in FEED_PRESETS else "humanities",
+                style=custom_style,
+            ).ask()
+            if not selected or selected.startswith("🔙"):
+                continue
+            _write_provider_field(env_path, "SCOUT_FEED_PRESET", selected)
+            _write_provider_field(env_path, "SCOUT_FEEDS", "")
+            _write_provider_field(env_path, "FEEDS", "")
+            print(f"  {GREEN}✓ 已切换信息源 preset：{selected}{RESET}")
+            continue
+
+        if action.startswith("🔗"):
+            env_values = _read_env_values(env_path)
+            current = _env_get(env_values, "SCOUT_FEEDS") or _env_get(env_values, "FEEDS") or ""
+            raw = questionary.text(
+                "输入 RSS URL（逗号、空格或换行分隔；留空取消）：",
+                default=current,
+                style=custom_style,
+            ).ask()
+            if raw is None or not raw.strip():
+                continue
+            _write_provider_field(env_path, "SCOUT_FEEDS", raw.strip())
+            _write_provider_field(env_path, "FEEDS", "")
+            print(f"  {GREEN}✓ 已保存自定义 RSS 列表。{RESET}")
+            continue
+
+        if action.startswith("🌐"):
+            current = _parse_env_bool(
+                _env_get(_read_env_values(env_path), "SCOUT_TRANSLATE"),
+                SCOUT_TRANSLATE,
+            )
+            enabled = questionary.confirm(
+                "是否自动把非中文文章翻译成中文后再评分/讨论？",
+                default=current,
+                style=custom_style,
+            ).ask()
+            if enabled is None:
+                continue
+            _write_provider_field(env_path, "SCOUT_TRANSLATE", "true" if enabled else "false")
+            print(f"  {GREEN}✓ 非中文文章自动翻译已{'开启' if enabled else '关闭'}。{RESET}")
 
 
 def _snapshot_provider_env(env_path: Path, prefix: str) -> dict[str, str | None]:
@@ -1942,9 +2024,20 @@ def _check_first_run() -> bool:
 
     if not has_key or not has_models:
         print(f"{YELLOW}⚠️  检测到 API 尚未配置。{RESET}")
-        print(f"{DIM}完整功能需要 OpenAI 兼容 API。"
-              f"请在主菜单选择「⚙️ 设置 → 配置 API / 模型」完成首次配置。{RESET}")
-        print(f"{DIM}参考 .env.example 了解支持的 Provider（OpenAI / DeepSeek / 本地 Ollama 等）。{RESET}\n")
+        print(f"{DIM}完整功能需要 OpenAI 兼容 API（支持 OpenAI / DeepSeek / 本地 Ollama 等）。{RESET}")
+        setup_now = questionary.confirm(
+            "是否现在进行快速配置？（只需填写 BASE_URL 和 API Key）",
+            default=True,
+            style=custom_style,
+        ).ask()
+        if setup_now:
+            done = _quick_setup()
+            if done:
+                print(f"{GREEN}✓ 配置完成，正在刷新...{RESET}\n")
+                return True
+            print(f"{DIM}稍后可在主菜单选择「⚙️ 设置 → ⚡ 快速配置」。{RESET}\n")
+        else:
+            print(f"{DIM}可随时在主菜单「⚙️ 设置」中完成配置。{RESET}\n")
         return False
     return True
 
@@ -2783,6 +2876,198 @@ def _interactive_cleanup():
     input(f"{DIM}按 Enter 继续...{RESET}")
 
 
+# 对话型节点：共享同一个高性能档案（绑到 OPENAI 作为全局默认，其余自动回落）。
+# 检索型节点：可单独绑定性价比档案（向量化 / 抓取评分）。
+_CHAT_PROVIDER_PREFIXES = ["OPENAI", "COUNCIL", "MEMORY", "JUDGE", "ROUTER", "FAST"]
+_RETRIEVAL_PROVIDER_PREFIXES = ["EMBEDDING", "SCOUT"]
+
+
+def _quick_setup_configure_profile(
+    env_path: Path,
+    profile_name: str,
+    title: str,
+    hint: str,
+    default_base_url: str = DEFAULT_OPENAI_BASE_URL,
+) -> str | None:
+    """快速配置单个 API 档案：只问 base_url + api_key，再自动抓取模型。
+
+    复用现有抓取与档案写入逻辑，不暴露 PROVIDER_TYPE / 逐节点字段。
+    返回规范化档案名；用户中途取消则返回 None。
+    """
+    normalized = _normalize_profile_name(profile_name)
+    profiles = _list_api_profiles(env_path)
+    current = profiles.get(normalized) or {}
+    current_models = current.get("models") or []
+
+    print(f"\n  {BOLD}{CYAN}--- {title} ---{RESET}")
+    print(f"  {DIM}{hint}{RESET}")
+    print(f"  {DIM}只需填写 BASE_URL 和 API Key，模型会自动从服务端抓取。{RESET}\n")
+
+    new_url = input(
+        f"    BASE_URL [{current.get('base_url') or default_base_url}]: "
+    ).strip()
+    if new_url == CLEAR_CONFIG_SENTINEL:
+        print(f"  {YELLOW}已取消。{RESET}")
+        return None
+    if not new_url:
+        new_url = current.get("base_url") or default_base_url
+
+    new_key = input(
+        f"    API_KEY [{_mask_api_key(current.get('api_key'))}]: "
+    ).strip()
+    if new_key == CLEAR_CONFIG_SENTINEL:
+        print(f"  {YELLOW}已取消。{RESET}")
+        return None
+    if not new_key:
+        new_key = None
+
+    next_api_key = new_key if new_key is not None else (current.get("api_key") or "")
+    provider_type = _resolve_provider_type_for_config(
+        None, new_url, current.get("provider_type", "openai")
+    )
+
+    # 自动抓取模型（不要求用户输入模型名）
+    models_raw = None
+    if next_api_key:
+        try:
+            print(f"    {DIM}正在从 {new_url} 抓取可用模型...{RESET}")
+            remote_models = _list_remote_models(next_api_key, new_url, provider_type)
+            if remote_models:
+                print(f"    {GREEN}✓ 已拉取 {len(remote_models)} 个模型。{RESET}")
+                picked = _choose_models_interactively(remote_models, current_models)
+                if picked:
+                    models_raw = ",".join(picked)
+                elif picked == []:
+                    print(f"    {YELLOW}未选中模型，将沿用当前值或留空。{RESET}")
+            else:
+                print(f"    {YELLOW}服务端未返回模型列表，保留当前设置。{RESET}")
+        except Exception as exc:
+            print(f"    {YELLOW}无法抓取模型列表：{exc}{RESET}")
+            print(f"    {DIM}{_format_model_list_failure_hint(new_url, provider_type)}{RESET}")
+            print(f"    {DIM}你可以稍后在「⚙️ 设置 → 管理 API 档案」中手动指定模型。{RESET}")
+    else:
+        print(f"    {YELLOW}未提供 API Key，跳过模型抓取。{RESET}")
+
+    # 写入档案字段
+    _write_provider_field(env_path, _profile_env_key(normalized, "BASE_URL"), new_url)
+    _write_provider_field(env_path, _profile_env_key(normalized, "API_KEY"), new_key)
+    _write_provider_field(
+        env_path, _profile_env_key(normalized, "PROVIDER_TYPE"), provider_type
+    )
+    if models_raw is not None:
+        _write_provider_field(
+            env_path, _profile_env_key(normalized, "MODEL_NAMES"), models_raw
+        )
+        _write_provider_field(
+            env_path, _profile_env_key(normalized, "MODEL_NAME"), ""
+        )
+
+    saved = _read_api_profile(env_path, normalized)
+    if saved and saved.get("models"):
+        print(
+            f"  {GREEN}✓ 档案「{profile_name}」已保存："
+            f"{_join_models(saved['models'])}{RESET}\n"
+        )
+    else:
+        print(
+            f"  {GREEN}✓ 档案「{profile_name}」已保存"
+            f"（模型未确定，可稍后在「⚙️ 设置」中补充）。{RESET}\n"
+        )
+    return normalized
+
+
+def _quick_setup() -> bool:
+    """极简快速配置（推荐新手）。
+
+    两步：
+      1. 配置对话型高性能档案 → 绑定到全部对话节点（OPENAI 作为全局默认，其余回落）。
+      2. 询问是否单独配置检索型性价比档案 → 绑定到 EMBEDDING / SCOUT。
+
+    返回 True 表示完成了主配置（对话型档案就绪）。
+    """
+    env_path = PROJECT_ROOT / ".env"
+    example_path = PROJECT_ROOT / ".env.example"
+
+    if not env_path.exists():
+        if example_path.exists():
+            shutil.copy(example_path, env_path)
+        else:
+            env_path.touch()
+
+    print(f"\n{BOLD}{MAGENTA}⚡ 快速配置{RESET}")
+    print(f"{DIM}只需两步即可用起全部功能。高级分档调度可稍后在「⚙️ 设置」里调整。{RESET}")
+
+    # ---- 第一步：对话型高性能档案 ----
+    chat_profile = _quick_setup_configure_profile(
+        env_path,
+        profile_name="main",
+        title="第一步：对话型高性能 API（辩论 / 记忆 / 裁决等）",
+        hint="用于深度对话、议事厅辩论、认知画像等需要强推理的任务。",
+    )
+    if chat_profile is None:
+        print(f"  {YELLOW}未完成对话型配置，快速配置中止。{RESET}\n")
+        return False
+
+    # 绑定到全部对话节点：OPENAI 作为全局默认，其余绑同一档案（确保一致）。
+    for prefix in _CHAT_PROVIDER_PREFIXES:
+        _assign_profile_to_provider(env_path, prefix, chat_profile)
+    print(
+        f"  {DIM}已将该档案应用到："
+        + " / ".join(PROVIDER_LABELS.get(p, p) for p in _CHAT_PROVIDER_PREFIXES)
+        + f"{RESET}\n"
+    )
+
+    # ---- 第二步：检索型性价比档案（可选）----
+    use_retrieval = questionary.confirm(
+        "是否单独配置一个用于检索的性价比 API（向量化 / 文章抓取评分）？\n"
+        f"  {DIM}否 = 检索任务也复用上面的高性能档案（更省事）。{RESET}",
+        default=False,
+        style=custom_style,
+    ).ask()
+
+    if use_retrieval:
+        retrieval_profile = _quick_setup_configure_profile(
+            env_path,
+            profile_name="retrieval",
+            title="第二步：检索型性价比 API（向量化 / 抓取）",
+            hint="用于文章向量化、Scout 评分排序等轻量任务，可选更便宜的模型。",
+        )
+        if retrieval_profile:
+            for prefix in _RETRIEVAL_PROVIDER_PREFIXES:
+                _assign_profile_to_provider(env_path, prefix, retrieval_profile)
+            print(
+                f"  {DIM}已将检索档案应用到："
+                + " / ".join(
+                    PROVIDER_LABELS.get(p, p) for p in _RETRIEVAL_PROVIDER_PREFIXES
+                )
+                + f"{RESET}\n"
+            )
+    else:
+        # 复用对话型档案：清除检索节点上的旧绑定，让其回落到全局 OPENAI 档案。
+        for prefix in _RETRIEVAL_PROVIDER_PREFIXES:
+            _write_provider_field(
+                env_path, _provider_profile_env_name(prefix), ""
+            )
+            # 顺带清掉可能存在的直填字段，确保干净回落
+            for key in (
+                f"{prefix}_PROVIDER_TYPE",
+                f"{prefix}_API_KEY",
+                f"{prefix}_BASE_URL",
+                f"{prefix}_MODEL_NAMES",
+                f"{prefix}_MODEL_NAME",
+            ):
+                _write_provider_field(env_path, key, "")
+        print(
+            f"  {DIM}检索任务将复用高性能档案（"
+            + " / ".join(PROVIDER_LABELS.get(p, p) for p in _RETRIEVAL_PROVIDER_PREFIXES)
+            + f"回落到全局默认）。{RESET}\n"
+        )
+
+    print(f"{BOLD}{GREEN}✅ 快速配置完成！{RESET}")
+    print(f"{DIM}现在可以开始「🚀 今日练习」了。如需更精细的分档调度，请用「⚙️ 设置 → 高级」。{RESET}\n")
+    return True
+
+
 def _interactive_config():
     """交互式 Config。"""
     env_path = PROJECT_ROOT / ".env"
@@ -2797,6 +3082,8 @@ def _interactive_config():
     action = questionary.select(
         "设置：",
         choices=[
+            "⚡ 快速配置（推荐新手）",
+            "📰 信息源设置",
             "📚 管理 API 档案",
             "🔗 为节点选择 API 档案",
             "🔧 高级：逐节点直接配置",
@@ -2808,6 +3095,14 @@ def _interactive_config():
     ).ask()
 
     if not action or action.startswith("🔙"):
+        return
+
+    if action.startswith("⚡"):
+        _quick_setup()
+        return
+
+    if action.startswith("📰"):
+        _configure_scout_sources(env_path)
         return
 
     if action.startswith("📚"):
